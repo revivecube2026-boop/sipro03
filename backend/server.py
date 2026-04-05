@@ -2130,6 +2130,26 @@ async def seed_admin():
     elif not verify_password(admin_password, existing["password_hash"]):
         await db.users.update_one({"email": admin_email}, {"$set": {"password_hash": hash_password(admin_password)}})
         logger.info(f"Admin password updated: {admin_email}")
+    
+    # Seed additional users for assignment system
+    sample_users = [
+        {"email": "marketing_admin@sipro.com", "name": "Rina Wati", "role": "marketing_admin"},
+        {"email": "sales1@sipro.com", "name": "Budi Perkasa", "role": "sales"},
+        {"email": "sales2@sipro.com", "name": "Dewi Anjani", "role": "sales"},
+        {"email": "finance@sipro.com", "name": "Hendra Gunawan", "role": "finance"},
+    ]
+    for su in sample_users:
+        existing = await db.users.find_one({"email": su["email"]})
+        if existing is None:
+            await db.users.insert_one({
+                "email": su["email"],
+                "password_hash": hash_password("sipro123"),
+                "name": su["name"],
+                "role": su["role"],
+                "status": "active",
+                "created_at": datetime.now(timezone.utc).isoformat()
+            })
+            logger.info(f"Seeded user: {su['email']} ({su['role']})")
 
 async def seed_sample_data():
     """Seed sample data for demo purposes"""
