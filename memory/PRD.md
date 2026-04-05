@@ -95,3 +95,8 @@ Continue development on SIPRO. System is a unit-centric operational system for p
 1. Phase C: Persistent task collection for follow-up and appointment tasks
 2. Phase C: Task assignment and SLA tracking
 3. Phase D: WhatsApp tracking improvements
+
+## Reports
+- Detailed Development Report: `/app/DEVELOPMENT_REPORT.md`
+- Dev Report UI: `/dev-report` page in SIPRO (34 items, 61% complete)
+
