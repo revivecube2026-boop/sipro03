@@ -80,9 +80,9 @@ class SIPROAPITester:
         return False
 
     def test_dashboard(self):
-        """Test dashboard endpoint - Phase A Foundation"""
+        """Test dashboard endpoint - Phase B Enhancement"""
         print("\n" + "="*50)
-        print("TESTING DASHBOARD - PHASE A FOUNDATION")
+        print("TESTING DASHBOARD - PHASE B ENHANCEMENT")
         print("="*50)
         
         success, response = self.run_test(
@@ -101,6 +101,15 @@ class SIPROAPITester:
             if missing_fields:
                 print(f"❌ Missing required dashboard fields: {missing_fields}")
                 return False
+            
+            # Check for Phase B enhancement fields
+            phase_b_fields = ['avg_response_minutes', 'responded_leads', 'pending_assignments']
+            phase_b_missing = [field for field in phase_b_fields if field not in data]
+            
+            if phase_b_missing:
+                print(f"⚠️  Missing Phase B dashboard fields: {phase_b_missing}")
+            else:
+                print(f"✅ Phase B dashboard fields found: avg_response_minutes={data.get('avg_response_minutes')}, responded_leads={data.get('responded_leads')}, pending_assignments={data.get('pending_assignments')}")
             
             # Check lead_stages structure
             if 'lead_stages' in data:
@@ -165,9 +174,9 @@ class SIPROAPITester:
         return success1 and success2
 
     def test_leads(self):
-        """Test CRM/leads endpoints - Phase A Foundation"""
+        """Test CRM/leads endpoints - Phase B Enhancement"""
         print("\n" + "="*50)
-        print("TESTING CRM/LEADS - PHASE A FOUNDATION")
+        print("TESTING CRM/LEADS - PHASE B ENHANCEMENT")
         print("="*50)
         
         # List all leads
@@ -227,14 +236,23 @@ class SIPROAPITester:
             if 'stages' in pipeline:
                 stages = pipeline['stages']
                 print(f"✅ Pipeline stages: {stages}")
-                # Verify expected stage counts from review request
-                expected_counts = {
-                    'acquisition': 4, 'nurturing': 4, 'appointment': 4, 
-                    'booking': 0, 'recycle': 8
-                }
-                for stage, expected in expected_counts.items():
-                    actual = stages.get(stage, 0)
-                    print(f"   {stage}: {actual} (expected: {expected})")
+        
+        # Test Phase B: Response Stats API
+        success8, stats_response = self.run_test(
+            "Get Lead Response Stats (Phase B)",
+            "GET",
+            "leads/response-stats",
+            200
+        )
+        
+        if success8 and stats_response.get('data'):
+            stats = stats_response['data']
+            required_stats = ['avg_response_minutes', 'waiting_for_contact', 'avg_wait_minutes', 'count']
+            missing_stats = [field for field in required_stats if field not in stats]
+            if missing_stats:
+                print(f"❌ Missing response stats fields: {missing_stats}")
+            else:
+                print(f"✅ Response stats: avg_response={stats.get('avg_response_minutes')}m, waiting={stats.get('waiting_for_contact')}, avg_wait={stats.get('avg_wait_minutes')}m")
         
         # Create a test lead with stage
         test_lead_data = {
@@ -246,7 +264,7 @@ class SIPROAPITester:
             "notes": "Test lead created by automated test"
         }
         
-        success8, lead_response = self.run_test(
+        success9, lead_response = self.run_test(
             "Create Lead with Stage",
             "POST",
             "leads",
@@ -254,7 +272,51 @@ class SIPROAPITester:
             data=test_lead_data
         )
         
-        return all([success1, success2, success3, success4, success5, success6, success7, success8])
+        # Store lead ID for further testing
+        test_lead_id = None
+        if success9 and lead_response.get('data'):
+            test_lead_id = lead_response['data'].get('id')
+            print(f"✅ Created test lead with ID: {test_lead_id}")
+        
+        # Test Phase B: Stage Transition API
+        success10 = True
+        if test_lead_id:
+            success10, transition_response = self.run_test(
+                "Stage Transition: Acquisition to Nurturing (Phase B)",
+                "POST",
+                f"leads/{test_lead_id}/transition",
+                200,
+                data={"stage": "nurturing", "reason": "Initial contact made"}
+            )
+            
+            if success10 and transition_response.get('data'):
+                lead_data = transition_response['data']
+                if lead_data.get('stage') == 'nurturing':
+                    print(f"✅ Stage transition successful: {lead_data.get('stage')}")
+                    if 'response_time_minutes' in lead_data:
+                        print(f"✅ Response time computed: {lead_data.get('response_time_minutes')} minutes")
+                else:
+                    print(f"❌ Stage transition failed: expected 'nurturing', got '{lead_data.get('stage')}'")
+                    success10 = False
+        
+        # Test Phase B: Timeline API
+        success11 = True
+        if test_lead_id:
+            success11, timeline_response = self.run_test(
+                "Get Lead Timeline (Phase B)",
+                "GET",
+                f"leads/{test_lead_id}/timeline",
+                200
+            )
+            
+            if success11 and timeline_response.get('data'):
+                timeline = timeline_response['data']
+                print(f"✅ Timeline retrieved with {len(timeline)} events")
+                # Check for different event types
+                event_types = set(item.get('type') for item in timeline)
+                print(f"   Event types: {event_types}")
+        
+        return all([success1, success2, success3, success4, success5, success6, success7, success8, success9, success10, success11])
 
     def test_deals(self):
         """Test deals endpoints"""
@@ -478,6 +540,84 @@ class SIPROAPITester:
         
         return success1 and success2 and success3
 
+    def test_assignment_system(self):
+        """Test Assignment System APIs (Phase B)"""
+        print("\n" + "="*50)
+        print("TESTING ASSIGNMENT SYSTEM (PHASE B)")
+        print("="*50)
+        
+        # First, get some leads to work with
+        success1, leads_response = self.run_test(
+            "Get Leads for Assignment Testing",
+            "GET",
+            "leads?stage=acquisition&limit=3",
+            200
+        )
+        
+        if not success1 or not leads_response.get('data'):
+            print("❌ No leads available for assignment testing")
+            return False
+        
+        leads = leads_response['data']
+        if len(leads) == 0:
+            print("❌ No acquisition leads found for assignment testing")
+            return False
+        
+        # Get first lead for testing
+        test_lead_id = leads[0]['id']
+        print(f"✅ Using lead {test_lead_id} for assignment testing")
+        
+        # Test manual assignment
+        assign_data = {
+            "lead_ids": [test_lead_id],
+            "assigned_to": "admin@sipro.com",
+            "reason": "Manual assignment for testing"
+        }
+        
+        success2, assign_response = self.run_test(
+            "Manual Lead Assignment",
+            "POST",
+            "leads/assign",
+            200,
+            data=assign_data
+        )
+        
+        if success2 and assign_response.get('data'):
+            assigned_count = assign_response['data'].get('assigned', 0)
+            print(f"✅ Manually assigned {assigned_count} lead(s)")
+        
+        # Test assignment response - accept
+        success3, accept_response = self.run_test(
+            "Accept Assignment",
+            "POST",
+            f"leads/{test_lead_id}/assignment/respond",
+            200,
+            data={"lead_id": test_lead_id, "action": "accept"}
+        )
+        
+        if success3 and accept_response.get('data'):
+            lead_data = accept_response['data']
+            if lead_data.get('assignment_status') == 'accepted':
+                print(f"✅ Assignment accepted successfully")
+            else:
+                print(f"❌ Assignment status not updated: {lead_data.get('assignment_status')}")
+                success3 = False
+        
+        # Test auto-assignment
+        success4, auto_assign_response = self.run_test(
+            "Auto-Assign Leads",
+            "POST",
+            "leads/auto-assign",
+            200,
+            data={"stage": "acquisition", "role": "sales"}
+        )
+        
+        if success4 and auto_assign_response.get('data'):
+            auto_assigned = auto_assign_response['data'].get('assigned', 0)
+            print(f"✅ Auto-assigned {auto_assigned} lead(s)")
+        
+        return all([success1, success2, success3, success4])
+
     def test_appointments(self):
         """Test Appointment Calendar APIs (Phase 2)"""
         print("\n" + "="*50)
@@ -504,9 +644,9 @@ class SIPROAPITester:
         return success1 and success2
 
 def main():
-    print("🚀 Starting SIPRO API Testing (Phase 2)...")
+    print("🚀 Starting SIPRO API Testing (Phase B)...")
     print(f"⏰ Test started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("📋 Testing Phase 1 + Phase 2 features (Finance, Construction, Notifications, Appointments)")
+    print("📋 Testing Phase B features: Assignment System, Stage Transitions, Response Time Tracking")
     
     # Setup
     tester = SIPROAPITester()
@@ -522,6 +662,7 @@ def main():
     test_results.append(("Projects", tester.test_projects()))
     test_results.append(("Units", tester.test_units()))
     test_results.append(("CRM/Leads", tester.test_leads()))
+    test_results.append(("Assignment System (Phase B)", tester.test_assignment_system()))
     test_results.append(("Deals", tester.test_deals()))
     test_results.append(("Siteplan", tester.test_siteplan()))
     test_results.append(("WhatsApp", tester.test_whatsapp()))

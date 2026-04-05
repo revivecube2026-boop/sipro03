@@ -94,6 +94,16 @@ class LeadCreate(BaseModel):
     assigned_to: Optional[str] = None
     stage: Optional[str] = None  # acquisition, nurturing, appointment, booking, recycle
 
+class LeadAssignRequest(BaseModel):
+    lead_ids: List[str]
+    assigned_to: str
+    reason: Optional[str] = None
+
+class LeadAssignmentResponse(BaseModel):
+    lead_id: str
+    action: str  # accept, reject
+    reason: Optional[str] = None
+
 class LeadActivityCreate(BaseModel):
     lead_id: str
     type: str  # call, chat, meeting, site_visit, note, reminder
@@ -557,6 +567,49 @@ async def get_lead_pipeline_inline(request: Request, project_id: Optional[str] =
         "funnel": [{"stage": s, "count": pipeline_data[s], "pct": round(pipeline_data[s] / total * 100)} for s in stages]
     }}
 
+@api_router.get("/leads/response-stats")
+async def get_lead_response_stats(request: Request):
+    """Get lead response time statistics for dashboard enhancement"""
+    await get_current_user(request, db)
+    
+    pipeline = [
+        {"$match": {"response_time_minutes": {"$exists": True, "$ne": None}}},
+        {"$group": {
+            "_id": None,
+            "avg_response_minutes": {"$avg": "$response_time_minutes"},
+            "min_response_minutes": {"$min": "$response_time_minutes"},
+            "max_response_minutes": {"$max": "$response_time_minutes"},
+            "count": {"$sum": 1}
+        }}
+    ]
+    stats = await db.leads.aggregate(pipeline).to_list(1)
+    
+    waiting = await db.leads.count_documents({"stage": "acquisition", "$or": [{"follow_up_count": 0}, {"follow_up_count": None}]})
+    
+    uncontacted_pipeline = [
+        {"$match": {"stage": "acquisition", "$or": [{"follow_up_count": 0}, {"follow_up_count": None}]}},
+        {"$project": {"created_at": 1}}
+    ]
+    uncontacted = await db.leads.aggregate(uncontacted_pipeline).to_list(100)
+    now_dt = datetime.now(timezone.utc)
+    avg_wait = 0
+    if uncontacted:
+        total_wait = 0
+        for lead_item in uncontacted:
+            try:
+                created_dt = datetime.fromisoformat(lead_item["created_at"].replace('Z', '+00:00'))
+                total_wait += (now_dt - created_dt).total_seconds() / 60
+            except Exception:
+                pass
+        avg_wait = total_wait / len(uncontacted) if uncontacted else 0
+    
+    stat_result = stats[0] if stats else {"avg_response_minutes": 0, "min_response_minutes": 0, "max_response_minutes": 0, "count": 0}
+    stat_result.pop("_id", None)
+    stat_result["waiting_for_contact"] = waiting
+    stat_result["avg_wait_minutes"] = round(avg_wait)
+    
+    return {"data": stat_result}
+
 @api_router.post("/leads")
 async def create_lead(req: LeadCreate, request: Request):
     user = await get_current_user(request, db)
@@ -772,6 +825,269 @@ async def import_leads(request: Request):
     })
     
     return {"data": {"imported": imported, "duplicates": duplicates, "errors": errors}}
+
+# ==================== LEAD ASSIGNMENT ROUTES ====================
+
+@api_router.post("/leads/assign")
+async def assign_leads(req: LeadAssignRequest, request: Request):
+    """Manual assign leads to a user"""
+    user = await get_current_user(request, db)
+    now = datetime.now(timezone.utc).isoformat()
+    
+    # Verify target user exists
+    target_user = await db.users.find_one({"email": req.assigned_to}, {"_id": 0, "email": 1, "name": 1, "role": 1})
+    if not target_user:
+        raise HTTPException(status_code=404, detail=f"User {req.assigned_to} not found")
+    
+    assigned_count = 0
+    for lead_id in req.lead_ids:
+        lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+        if not lead:
+            continue
+        
+        old_assignee = lead.get("assigned_to")
+        history_entry = {
+            "from": old_assignee,
+            "to": req.assigned_to,
+            "assigned_by": user.get("email"),
+            "reason": req.reason,
+            "action": "assigned",
+            "timestamp": now
+        }
+        
+        await db.leads.update_one({"id": lead_id}, {
+            "$set": {
+                "assigned_to": req.assigned_to,
+                "assignment_status": "pending",
+                "updated_at": now
+            },
+            "$push": {"assignment_history": history_entry}
+        })
+        
+        # Log event
+        await db.events.insert_one({
+            "id": str(uuid.uuid4()),
+            "type": "lead.assigned",
+            "entity_type": "lead",
+            "entity_id": lead_id,
+            "data": {"from": old_assignee, "to": req.assigned_to, "by": user.get("email"), "reason": req.reason},
+            "created_at": now
+        })
+        assigned_count += 1
+    
+    return {"data": {"assigned": assigned_count, "target": req.assigned_to}}
+
+@api_router.post("/leads/auto-assign")
+async def auto_assign_leads(request: Request):
+    """Round-robin auto-assign unassigned leads to marketing inhouse users"""
+    user = await get_current_user(request, db)
+    body = await request.json()
+    stage = body.get("stage", "acquisition")
+    role_filter = body.get("role", "sales")
+    now = datetime.now(timezone.utc).isoformat()
+    
+    # Get eligible users (marketing inhouse / sales)
+    eligible_roles = ["sales", "marketing_inhouse"]
+    eligible_users = await db.users.find(
+        {"role": {"$in": eligible_roles}, "status": "active"},
+        {"_id": 0, "email": 1, "name": 1}
+    ).to_list(100)
+    
+    if not eligible_users:
+        raise HTTPException(status_code=400, detail="No eligible users for auto-assignment")
+    
+    # Get unassigned leads in the specified stage
+    unassigned = await db.leads.find(
+        {"$or": [{"assigned_to": None}, {"assigned_to": ""}], "stage": stage},
+        {"_id": 0, "id": 1}
+    ).to_list(500)
+    
+    if not unassigned:
+        return {"data": {"assigned": 0, "message": "No unassigned leads found"}}
+    
+    # Round-robin assignment
+    assigned_count = 0
+    for i, lead in enumerate(unassigned):
+        target = eligible_users[i % len(eligible_users)]
+        history_entry = {
+            "from": None,
+            "to": target["email"],
+            "assigned_by": "system:auto-assign",
+            "reason": "Round-robin auto-assignment",
+            "action": "auto_assigned",
+            "timestamp": now
+        }
+        await db.leads.update_one({"id": lead["id"]}, {
+            "$set": {
+                "assigned_to": target["email"],
+                "assignment_status": "pending",
+                "updated_at": now
+            },
+            "$push": {"assignment_history": history_entry}
+        })
+        await db.events.insert_one({
+            "id": str(uuid.uuid4()),
+            "type": "lead.auto_assigned",
+            "entity_type": "lead",
+            "entity_id": lead["id"],
+            "data": {"to": target["email"], "method": "round_robin"},
+            "created_at": now
+        })
+        assigned_count += 1
+    
+    return {"data": {"assigned": assigned_count, "users": [u["email"] for u in eligible_users]}}
+
+@api_router.post("/leads/{lead_id}/assignment/respond")
+async def respond_to_assignment(lead_id: str, req: LeadAssignmentResponse, request: Request):
+    """Accept or reject a lead assignment"""
+    user = await get_current_user(request, db)
+    now = datetime.now(timezone.utc).isoformat()
+    
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    
+    if lead.get("assigned_to") != user.get("email"):
+        raise HTTPException(status_code=403, detail="You are not the assigned user for this lead")
+    
+    if req.action == "accept":
+        history_entry = {
+            "from": user.get("email"),
+            "to": user.get("email"),
+            "assigned_by": user.get("email"),
+            "reason": "Accepted",
+            "action": "accepted",
+            "timestamp": now
+        }
+        await db.leads.update_one({"id": lead_id}, {
+            "$set": {"assignment_status": "accepted", "updated_at": now},
+            "$push": {"assignment_history": history_entry}
+        })
+        await db.events.insert_one({
+            "id": str(uuid.uuid4()),
+            "type": "lead.assignment_accepted",
+            "entity_type": "lead",
+            "entity_id": lead_id,
+            "data": {"user": user.get("email")},
+            "created_at": now
+        })
+    elif req.action == "reject":
+        history_entry = {
+            "from": user.get("email"),
+            "to": None,
+            "assigned_by": user.get("email"),
+            "reason": req.reason or "Rejected",
+            "action": "rejected",
+            "timestamp": now
+        }
+        await db.leads.update_one({"id": lead_id}, {
+            "$set": {"assigned_to": None, "assignment_status": "rejected", "updated_at": now},
+            "$push": {"assignment_history": history_entry}
+        })
+        await db.events.insert_one({
+            "id": str(uuid.uuid4()),
+            "type": "lead.assignment_rejected",
+            "entity_type": "lead",
+            "entity_id": lead_id,
+            "data": {"user": user.get("email"), "reason": req.reason},
+            "created_at": now
+        })
+    else:
+        raise HTTPException(status_code=400, detail="Action must be 'accept' or 'reject'")
+    
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    return {"data": lead}
+
+@api_router.post("/leads/{lead_id}/transition")
+async def transition_lead_stage(lead_id: str, request: Request):
+    """Controlled stage transition with logging"""
+    user = await get_current_user(request, db)
+    body = await request.json()
+    new_stage = body.get("stage")
+    reason = body.get("reason", "")
+    now = datetime.now(timezone.utc).isoformat()
+    
+    valid_stages = ["acquisition", "nurturing", "appointment", "booking", "recycle"]
+    if new_stage not in valid_stages:
+        raise HTTPException(status_code=400, detail=f"Invalid stage. Must be one of: {valid_stages}")
+    
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    
+    old_stage = lead.get("stage", "acquisition")
+    if old_stage == new_stage:
+        return {"data": lead, "message": "Already in this stage"}
+    
+    # Update stage and compute response time if first contact
+    update_fields = {"stage": new_stage, "updated_at": now}
+    
+    # If moving from acquisition to nurturing, track first contact time
+    if old_stage == "acquisition" and new_stage == "nurturing":
+        update_fields["status"] = "contacted"
+        update_fields["last_contacted_at"] = now
+        update_fields["follow_up_count"] = (lead.get("follow_up_count") or 0) + 1
+        # Compute response time
+        created_at = lead.get("created_at")
+        if created_at:
+            try:
+                created_dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                now_dt = datetime.now(timezone.utc)
+                response_minutes = int((now_dt - created_dt).total_seconds() / 60)
+                update_fields["response_time_minutes"] = response_minutes
+            except Exception:
+                pass
+    
+    # Map stage to compatible status for backward compatibility
+    stage_to_status = {"acquisition": "new", "nurturing": "contacted", "appointment": "prospect", "booking": "prospect", "recycle": "no_response"}
+    if not body.get("keep_status"):
+        update_fields["status"] = stage_to_status.get(new_stage, lead.get("status"))
+    
+    await db.leads.update_one({"id": lead_id}, {"$set": update_fields})
+    
+    # Log event
+    await db.events.insert_one({
+        "id": str(uuid.uuid4()),
+        "type": "lead.stage_changed",
+        "entity_type": "lead",
+        "entity_id": lead_id,
+        "data": {"from_stage": old_stage, "to_stage": new_stage, "reason": reason, "by": user.get("email")},
+        "created_at": now
+    })
+    
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    return {"data": lead}
+
+@api_router.get("/leads/{lead_id}/timeline")
+async def get_lead_timeline(lead_id: str, request: Request):
+    """Get comprehensive timeline for a lead (activities + events + assignments)"""
+    user = await get_current_user(request, db)
+    
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    
+    # Gather all timeline items
+    activities = await db.lead_activities.find({"lead_id": lead_id}, {"_id": 0}).to_list(100)
+    events = await db.events.find({"entity_id": lead_id}, {"_id": 0}).to_list(100)
+    wa_messages = await db.whatsapp_messages.find({"recipient_phone": lead.get("phone")}, {"_id": 0}).to_list(50)
+    
+    timeline = []
+    for a in activities:
+        timeline.append({"type": "activity", "subtype": a.get("type"), "description": a.get("description"), "outcome": a.get("outcome"), "created_by": a.get("created_by"), "created_at": a.get("created_at"), "id": a.get("id")})
+    for e in events:
+        timeline.append({"type": "event", "subtype": e.get("type"), "description": str(e.get("data", {})), "created_at": e.get("created_at"), "id": e.get("id")})
+    for m in wa_messages:
+        timeline.append({"type": "whatsapp", "subtype": m.get("message_type", "message"), "description": m.get("message", "")[:100], "status": m.get("status"), "created_by": m.get("sent_by"), "created_at": m.get("created_at"), "id": m.get("id")})
+    
+    # Add assignment history from lead doc
+    for ah in (lead.get("assignment_history") or []):
+        timeline.append({"type": "assignment", "subtype": ah.get("action"), "description": f"{ah.get('action','assigned')}: {ah.get('from', '?')} → {ah.get('to', '?')}", "reason": ah.get("reason"), "created_by": ah.get("assigned_by"), "created_at": ah.get("timestamp"), "id": None})
+    
+    # Sort by created_at descending
+    timeline.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+    
+    return {"data": timeline}
 
 # ==================== APPOINTMENT ROUTES ====================
 
@@ -1747,7 +2063,7 @@ async def get_dashboard(request: Request):
     # Unassigned leads (for marketing admin to distribute)
     unassigned_leads = await db.leads.count_documents({"$or": [{"assigned_to": None}, {"assigned_to": ""}], "stage": {"$nin": ["recycle"]}})
     
-    return {
+    result = {
         "data": {
             "projects": {"total": total_projects, "active": active_projects},
             "units": {"total": total_units, "available": available_units, "reserved": reserved_units, "booked": booked_units, "sold": sold_units},
@@ -1774,8 +2090,24 @@ async def get_dashboard(request: Request):
             "user_role": user_role,
             "user_email": user_email,
             "overdue_payments": await db.billing_schedules.count_documents({"outstanding": {"$gt": 0}}),
+            "pending_assignments": await db.leads.count_documents({"assigned_to": user_email, "assignment_status": "pending"}),
         }
     }
+    
+    # Compute response time stats inline
+    rt_pipeline = [
+        {"$match": {"response_time_minutes": {"$exists": True, "$ne": None}}},
+        {"$group": {"_id": None, "avg": {"$avg": "$response_time_minutes"}, "count": {"$sum": 1}}}
+    ]
+    rt_stats = await db.leads.aggregate(rt_pipeline).to_list(1)
+    if rt_stats:
+        result["data"]["avg_response_minutes"] = round(rt_stats[0]["avg"])
+        result["data"]["responded_leads"] = rt_stats[0]["count"]
+    else:
+        result["data"]["avg_response_minutes"] = 0
+        result["data"]["responded_leads"] = 0
+    
+    return result
 
 # ==================== SEED DATA ====================
 

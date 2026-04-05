@@ -152,6 +152,12 @@ export default function DashboardPage() {
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
             <Layers size={13} color="#2563eb" />
             <span style={{ fontSize: 12, fontWeight: 800 }}>Lead Lifecycle</span>
+            {/* Response Time Indicator */}
+            {d.avg_response_minutes > 0 && (
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3, fontSize: 9, fontWeight: 700, color: d.avg_response_minutes <= 30 ? '#10b981' : d.avg_response_minutes <= 120 ? '#f59e0b' : '#ef4444', background: d.avg_response_minutes <= 30 ? 'rgba(16,185,129,0.08)' : d.avg_response_minutes <= 120 ? 'rgba(245,158,11,0.08)' : 'rgba(239,68,68,0.08)', padding: '2px 7px', borderRadius: 5 }}>
+                <Clock size={9} />Avg Response: {d.avg_response_minutes < 60 ? `${d.avg_response_minutes}m` : `${Math.round(d.avg_response_minutes / 60)}h`}
+              </span>
+            )}
             <span style={{ fontSize: 9, color: '#8896ab', marginLeft: 'auto' }}>{pl.total || 0} total</span>
           </div>
           <div style={{ display: 'flex', gap: 4 }}>
