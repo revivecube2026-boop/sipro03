@@ -111,18 +111,9 @@ Continue development on SIPRO. System is a unit-centric operational system for p
 
 ## Prioritized Backlog
 
-### P0 (Phase E - Customer Entity & Commission)
-- [ ] First-class `customers` collection: NIK, NPWP, alamat, pasangan, ahli waris
-- [ ] Backfill customers from existing deals (group by phone) — non-destructive
-- [ ] Deal → customer_id link (kept duplicate fields for backward-compat)
-- [ ] Customers CRUD endpoints + UI
-- [ ] Commission rules (per project / per role / flat % or tier)
-- [ ] Auto-calculate commission on deal status=booked
-- [ ] Commission payout tracking
-
 ### P0 (Phase F - Legal Documents & KPR)
 - [ ] Document workflow: SPK, PPJB, AJB, BAST templates (Bahasa Indonesia formal)
-- [ ] Server-side PDF generation
+- [ ] Server-side PDF generation (WeasyPrint or reportlab)
 - [ ] E-sign placeholder (upload + timestamp)
 - [ ] Financing module: bank, plafond, DP, tenor, BI checking, approval status
 - [ ] Deal → financing application link
@@ -146,9 +137,8 @@ Continue development on SIPRO. System is a unit-centric operational system for p
 - [ ] Recurring task scheduler
 
 ## Next Tasks
-1. **Phase E**: Customer entity + Commission engine
-2. **Phase F**: Documents (PPJB/AJB) + KPR module
-3. **Phase G**: SLA escalation, WhatsApp incoming, Broadcast, marketing ROI, lead scoring
+1. **Phase F**: Documents (PPJB/AJB) + KPR module + auto billing template
+2. **Phase G**: SLA escalation, WhatsApp incoming, Broadcast, marketing ROI, lead scoring
 
 ## Reports
 - Detailed Development Report: `/app/DEVELOPMENT_REPORT.md`
