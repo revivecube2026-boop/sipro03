@@ -69,17 +69,41 @@ Continue development on SIPRO. System is a unit-centric operational system for p
    - Lead detail panel with stage transition buttons
    - Auto-assign and manual assign buttons
 
+### Phase C - Task Engine (2026-05-19)
+1. **Persistent `tasks` collection** with schema: id, title, description, type, status, priority, related_entity_type, related_entity_id, assigned_to, due_date, source_event, auto_generated, outcome, activity_history[], created_by, created_at, updated_at, completed_at
+2. **Task Types**: contact, follow_up, appointment, recycle, custom
+3. **API Endpoints**:
+   - GET /api/tasks (filters: status, type, assigned_to, related_entity_id, mine, overdue)
+   - GET /api/tasks/stats (open, overdue, today, completed, by_type)
+   - GET /api/tasks/{id}
+   - POST /api/tasks (manual create, role-permission enforced)
+   - PUT /api/tasks/{id} (update fields with activity_history append)
+   - POST /api/tasks/{id}/complete (outcome required)
+   - DELETE /api/tasks/{id} (admin-only)
+   - GET/PUT /api/tasks/permissions (configurable allowed_roles)
+4. **Auto-task triggers (idempotent via source_event)**:
+   - On `lead.created` → contact task, due +1h
+   - On stage→nurturing → follow_up task, due +2d
+   - On stage→appointment → appointment task, due +1d
+   - On stage→booking → urgent follow_up, due +1d
+   - On stage→recycle → recycle task, due +7d
+   - On appointment.created → reminder task, due 1h before scheduled
+5. **Frontend**:
+   - Dedicated `/tasks` page with stats, filters (status/type/mine/overdue), table, complete/snooze/cancel actions
+   - CreateTaskModal & PermissionsModal
+   - `LeadTasksPanel` reusable component embedded in CRM lead detail panel
+   - Sidebar nav under Sales section
+   - Dashboard "Task Overdue / Task Aktif" indicators
+   - Indonesian language strings
+6. **Dashboard**: `my_tasks: { open, overdue, completed }` exposed per user
+7. **Tested**: 19/19 backend pytest cases pass; full frontend Playwright verification — no bugs.
+
 ## Prioritized Backlog
 
-### P0 (Phase C - Task Engine)
-- [ ] Persistent `tasks` collection (follow-up tasks, appointment tasks)
-- [ ] Lead timeline/activity log improvements
-- [ ] Task assignment and outcome tracking
-
 ### P1 (Phase D - Enhancement)
-- [ ] SLA logic and escalation
+- [ ] SLA logic and escalation (Lead Response Time)
 - [ ] WhatsApp incoming message detection
-- [ ] Broadcast system for acquisition stage
+- [ ] Broadcast system for acquisition stage (limited to acquisition stage only)
 - [ ] Lead scoring engine (quality_score computation)
 - [ ] Survey validation (forms, photos, notes)
 
@@ -89,14 +113,17 @@ Continue development on SIPRO. System is a unit-centric operational system for p
 - [ ] Commission engine
 - [ ] Customer portal
 - [ ] Strict RBAC enforcement
-- [ ] Backend modularization (split server.py)
+- [ ] Backend modularization (split server.py — currently 3026 lines)
+- [ ] Task notifications via WhatsApp / email when overdue
+- [ ] Recurring task scheduler
 
 ## Next Tasks
-1. Phase C: Persistent task collection for follow-up and appointment tasks
-2. Phase C: Task assignment and SLA tracking
-3. Phase D: WhatsApp tracking improvements
+1. Phase D: SLA logic + escalation rules
+2. Phase D: WhatsApp incoming message tracking
+3. Phase D: Broadcast system (Acquisition stage only)
 
 ## Reports
 - Detailed Development Report: `/app/DEVELOPMENT_REPORT.md`
-- Dev Report UI: `/dev-report` page in SIPRO (34 items, 61% complete)
+- Dev Report UI: `/dev-report` page in SIPRO
+- Phase C test report: `/app/test_reports/iteration_6.json` (19/19 pytest pass)
 
