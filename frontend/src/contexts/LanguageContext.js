@@ -107,6 +107,7 @@ const translations = {
     qc: 'Quality Control',
     overdue: 'Overdue',
     auto_followup: 'Auto Follow-Up',
+    tasks: 'Tasks',
   },
   en: {
     dashboard: 'Dashboard',
@@ -212,6 +213,7 @@ const translations = {
     qc: 'Quality Control',
     overdue: 'Overdue',
     auto_followup: 'Auto Follow-Up',
+    tasks: 'Tasks',
   }
 };
 

@@ -118,6 +118,9 @@ export default function DashboardPage() {
     if (myLeads.nurturing > 0) tasks.push({ type: 'warning', icon: MessageCircle, title: `${myLeads.nurturing} Lead Nurturing`, desc: 'Follow-up lanjutan diperlukan', path: '/crm?stage=nurturing', color: '#f59e0b' });
     if (d.my_appointments > 0) tasks.push({ type: 'info', icon: Calendar, title: `${d.my_appointments} Jadwal Aktif`, desc: 'Survey / appointment terjadwal', path: '/appointments', color: '#2563eb' });
   }
+  // Phase C: persistent task indicators (visible for any sales-facing role)
+  if (d.my_tasks?.overdue > 0) tasks.push({ type: 'urgent', icon: AlertTriangle, title: `${d.my_tasks.overdue} Task Overdue`, desc: 'Task yang sudah melewati due date', path: '/tasks', color: '#ef4444' });
+  if (d.my_tasks?.open > 0 && !d.my_tasks?.overdue) tasks.push({ type: 'info', icon: Clock, title: `${d.my_tasks.open} Task Aktif`, desc: 'Buka untuk melihat detail task', path: '/tasks', color: '#2563eb' });
   if (viewMode === 'management' || viewMode === 'finance') {
     if (d.finance?.outstanding > 0) tasks.push({ type: 'warning', icon: DollarSign, title: `Outstanding ${fmt(d.finance.outstanding)}`, desc: `${d.overdue_payments || 0} billing overdue`, path: '/finance', color: '#ef4444' });
   }

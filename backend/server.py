@@ -207,6 +207,32 @@ class AutoFollowUpRuleCreate(BaseModel):
     channel: str = "whatsapp"  # whatsapp, in_app
     is_active: bool = True
 
+# ---- Phase C: Task Engine Models ----
+class TaskCreate(BaseModel):
+    title: str
+    description: Optional[str] = None
+    type: str = "custom"  # follow_up, appointment, contact, recycle, custom
+    related_entity_type: Optional[str] = None  # lead, appointment, deal
+    related_entity_id: Optional[str] = None
+    assigned_to: Optional[str] = None
+    due_date: Optional[str] = None  # ISO datetime
+    priority: str = "medium"  # low, medium, high, urgent
+
+class TaskUpdate(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    status: Optional[str] = None  # open, in_progress, completed, canceled, snoozed
+    outcome: Optional[str] = None
+    assigned_to: Optional[str] = None
+    due_date: Optional[str] = None
+    priority: Optional[str] = None
+
+class TaskComplete(BaseModel):
+    outcome: Optional[str] = None
+
+class TaskPermissionsUpdate(BaseModel):
+    allowed_roles: List[str] = ["super_admin", "marketing_admin", "marketing_inhouse", "sales"]
+
 # ==================== AUTH ROUTES ====================
 
 @api_router.post("/auth/register")
@@ -658,7 +684,20 @@ async def create_lead(req: LeadCreate, request: Request):
         "data": {"name": req.name, "source": req.source},
         "created_at": datetime.now(timezone.utc).isoformat()
     })
-    
+
+    # Phase C: Auto-create first-contact task for new leads
+    await _auto_create_task(
+        title=f"Hubungi lead baru: {req.name}",
+        description=f"Lead baru dari {req.source}. Lakukan kontak pertama dalam 1 jam.",
+        type="contact",
+        priority="high",
+        source_event=f"lead.created:{lead_doc['id']}",
+        related_entity_type="lead",
+        related_entity_id=lead_doc["id"],
+        assigned_to=req.assigned_to,
+        due_date=_due_in(hours=1),
+    )
+
     return {"data": lead_doc}
 
 @api_router.put("/leads/{lead_id}")
@@ -1054,7 +1093,61 @@ async def transition_lead_stage(lead_id: str, request: Request):
         "data": {"from_stage": old_stage, "to_stage": new_stage, "reason": reason, "by": user.get("email")},
         "created_at": now
     })
-    
+
+    # Phase C: Auto-task on stage transitions
+    assignee = lead.get("assigned_to")
+    lead_name = lead.get("name", "Lead")
+    if new_stage == "nurturing":
+        # After first contact, schedule a follow-up call in 2 days
+        await _auto_create_task(
+            title=f"Follow-up nurturing: {lead_name}",
+            description="Lead sudah dihubungi. Lakukan follow-up untuk menjaga engagement.",
+            type="follow_up",
+            priority="medium",
+            source_event=f"lead.stage:nurturing:{lead_id}",
+            related_entity_type="lead",
+            related_entity_id=lead_id,
+            assigned_to=assignee,
+            due_date=_due_in(days=2),
+        )
+    elif new_stage == "appointment":
+        # Schedule appointment task
+        await _auto_create_task(
+            title=f"Jadwalkan appointment: {lead_name}",
+            description="Lead siap untuk appointment / site visit. Konfirmasi jadwal segera.",
+            type="appointment",
+            priority="high",
+            source_event=f"lead.stage:appointment:{lead_id}",
+            related_entity_type="lead",
+            related_entity_id=lead_id,
+            assigned_to=assignee,
+            due_date=_due_in(days=1),
+        )
+    elif new_stage == "booking":
+        await _auto_create_task(
+            title=f"Proses booking: {lead_name}",
+            description="Lead siap booking unit. Bantu proses booking & dokumen.",
+            type="follow_up",
+            priority="urgent",
+            source_event=f"lead.stage:booking:{lead_id}",
+            related_entity_type="lead",
+            related_entity_id=lead_id,
+            assigned_to=assignee,
+            due_date=_due_in(days=1),
+        )
+    elif new_stage == "recycle":
+        await _auto_create_task(
+            title=f"Re-engage lead: {lead_name}",
+            description="Lead masuk daur ulang. Coba kontak ulang dengan pendekatan berbeda dalam 7 hari.",
+            type="recycle",
+            priority="low",
+            source_event=f"lead.stage:recycle:{lead_id}",
+            related_entity_type="lead",
+            related_entity_id=lead_id,
+            assigned_to=assignee,
+            due_date=_due_in(days=7),
+        )
+
     lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
     return {"data": lead}
 
@@ -1117,6 +1210,28 @@ async def create_appointment(req: AppointmentCreate, request: Request):
     }
     await db.appointments.insert_one(appt_doc)
     appt_doc.pop("_id", None)
+
+    # Phase C: Auto-create appointment reminder task (1 hour before)
+    from datetime import timedelta
+    try:
+        sched_dt = datetime.fromisoformat(req.scheduled_at.replace('Z', '+00:00'))
+        reminder_due = (sched_dt - timedelta(hours=1)).isoformat()
+    except Exception:
+        reminder_due = req.scheduled_at
+    lead = await db.leads.find_one({"id": req.lead_id}, {"_id": 0, "name": 1}) if req.lead_id else None
+    lead_name = (lead or {}).get("name", "Lead")
+    await _auto_create_task(
+        title=f"Pengingat appointment: {lead_name}",
+        description=f"Appointment dijadwalkan pada {req.scheduled_at}. Konfirmasi & siapkan materi.",
+        type="appointment",
+        priority="high",
+        source_event=f"appointment.created:{appt_doc['id']}",
+        related_entity_type="appointment",
+        related_entity_id=appt_doc["id"],
+        assigned_to=appt_doc["assigned_to"],
+        due_date=reminder_due,
+    )
+
     return {"data": appt_doc}
 
 @api_router.put("/appointments/{appt_id}")
@@ -1980,6 +2095,256 @@ async def get_appointment_calendar(request: Request, month: Optional[str] = None
     
     return {"data": appointments}
 
+# ==================== PHASE C: TASK ENGINE ====================
+# Persistent tasks collection. Task types:
+#   follow_up      - manual or auto follow-up task (e.g. after lead created)
+#   appointment    - scheduling / pre-appointment reminder
+#   contact        - first contact task on new lead
+#   recycle        - re-engagement task when lead moves to recycle
+#   custom         - free-form task
+# Status: open | in_progress | completed | canceled | snoozed
+# Dedup: source_event is a unique key per (entity, trigger) — second auto-trigger
+# of the same source_event will NOT recreate a task while one is open.
+
+async def _get_task_permissions():
+    """Return list of roles allowed to create persistent tasks. Configurable."""
+    doc = await db.app_settings.find_one({"key": "tasks_permissions"}, {"_id": 0})
+    if not doc:
+        return ["super_admin", "marketing_admin", "marketing_inhouse", "sales"]
+    return doc.get("allowed_roles") or []
+
+async def _auto_create_task(
+    *, title: str, type: str, source_event: str,
+    related_entity_type: str, related_entity_id: str,
+    assigned_to: Optional[str] = None, due_date: Optional[str] = None,
+    description: Optional[str] = None, priority: str = "medium",
+):
+    """Idempotent auto-task creation. Skips if an OPEN task with same source_event exists."""
+    existing = await db.tasks.find_one({
+        "source_event": source_event,
+        "status": {"$in": ["open", "in_progress", "snoozed"]},
+    }, {"_id": 0, "id": 1})
+    if existing:
+        return None
+    now = datetime.now(timezone.utc).isoformat()
+    task_doc = {
+        "id": str(uuid.uuid4()),
+        "title": title,
+        "description": description,
+        "type": type,
+        "status": "open",
+        "priority": priority,
+        "related_entity_type": related_entity_type,
+        "related_entity_id": related_entity_id,
+        "assigned_to": assigned_to,
+        "due_date": due_date,
+        "source_event": source_event,
+        "auto_generated": True,
+        "outcome": None,
+        "activity_history": [{"action": "auto_created", "by": "system", "at": now}],
+        "created_by": "system",
+        "created_at": now,
+        "updated_at": now,
+    }
+    await db.tasks.insert_one(task_doc)
+    task_doc.pop("_id", None)
+    return task_doc
+
+
+def _due_in(hours: int = 0, days: int = 0) -> str:
+    from datetime import timedelta
+    return (datetime.now(timezone.utc) + timedelta(hours=hours, days=days)).isoformat()
+
+
+@api_router.get("/tasks")
+async def list_tasks(
+    request: Request,
+    status: Optional[str] = None,
+    type: Optional[str] = None,
+    assigned_to: Optional[str] = None,
+    related_entity_type: Optional[str] = None,
+    related_entity_id: Optional[str] = None,
+    mine: Optional[bool] = False,
+    overdue: Optional[bool] = False,
+    skip: int = 0,
+    limit: int = 100,
+):
+    user = await get_current_user(request, db)
+    query: dict = {}
+    if status:
+        query["status"] = {"$in": status.split(",")} if "," in status else status
+    if type:
+        query["type"] = type
+    if assigned_to:
+        query["assigned_to"] = assigned_to
+    if mine:
+        query["assigned_to"] = user.get("email")
+    if related_entity_type:
+        query["related_entity_type"] = related_entity_type
+    if related_entity_id:
+        query["related_entity_id"] = related_entity_id
+    if overdue:
+        query["due_date"] = {"$lt": datetime.now(timezone.utc).isoformat()}
+        query["status"] = {"$in": ["open", "in_progress", "snoozed"]}
+    total = await db.tasks.count_documents(query)
+    tasks = await db.tasks.find(query, {"_id": 0}).sort("due_date", 1).skip(skip).limit(limit).to_list(limit)
+    # Enrich with related lead names where applicable
+    lead_ids = [t["related_entity_id"] for t in tasks if t.get("related_entity_type") == "lead" and t.get("related_entity_id")]
+    if lead_ids:
+        leads = await db.leads.find({"id": {"$in": list(set(lead_ids))}}, {"_id": 0, "id": 1, "name": 1, "phone": 1, "stage": 1}).to_list(len(lead_ids))
+        lead_map = {l["id"]: l for l in leads}
+        for t in tasks:
+            if t.get("related_entity_type") == "lead":
+                lead = lead_map.get(t.get("related_entity_id"))
+                if lead:
+                    t["related_lead_name"] = lead.get("name")
+                    t["related_lead_phone"] = lead.get("phone")
+                    t["related_lead_stage"] = lead.get("stage")
+    return {"data": tasks, "total": total}
+
+
+@api_router.get("/tasks/stats")
+async def tasks_stats(request: Request, mine: Optional[bool] = False):
+    user = await get_current_user(request, db)
+    base: dict = {}
+    if mine:
+        base["assigned_to"] = user.get("email")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    open_q = {**base, "status": {"$in": ["open", "in_progress", "snoozed"]}}
+    overdue_q = {**open_q, "due_date": {"$lt": now_iso}}
+    from datetime import timedelta
+    today_end = (datetime.now(timezone.utc).replace(hour=23, minute=59, second=59)).isoformat()
+    today_q = {**open_q, "due_date": {"$lte": today_end, "$gte": now_iso}}
+    return {
+        "data": {
+            "total_open": await db.tasks.count_documents(open_q),
+            "overdue": await db.tasks.count_documents(overdue_q),
+            "today": await db.tasks.count_documents(today_q),
+            "completed": await db.tasks.count_documents({**base, "status": "completed"}),
+            "by_type": {
+                t: await db.tasks.count_documents({**open_q, "type": t})
+                for t in ["follow_up", "appointment", "contact", "recycle", "custom"]
+            },
+        }
+    }
+
+
+@api_router.get("/tasks/permissions")
+async def get_tasks_permissions(request: Request):
+    user = await get_current_user(request, db)
+    return {"data": {"allowed_roles": await _get_task_permissions()}}
+
+
+@api_router.put("/tasks/permissions")
+async def update_tasks_permissions(req: TaskPermissionsUpdate, request: Request):
+    user = await get_current_user(request, db)
+    if user.get("role") not in ["super_admin", "marketing_admin"]:
+        raise HTTPException(status_code=403, detail="Only admins can change task permissions")
+    now = datetime.now(timezone.utc).isoformat()
+    await db.app_settings.update_one(
+        {"key": "tasks_permissions"},
+        {"$set": {"key": "tasks_permissions", "allowed_roles": req.allowed_roles, "updated_at": now, "updated_by": user.get("email")}},
+        upsert=True,
+    )
+    return {"data": {"allowed_roles": req.allowed_roles}}
+
+
+@api_router.post("/tasks")
+async def create_task(req: TaskCreate, request: Request):
+    user = await get_current_user(request, db)
+    allowed = await _get_task_permissions()
+    if user.get("role") not in allowed and user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Your role is not allowed to create tasks")
+    now = datetime.now(timezone.utc).isoformat()
+    task_doc = {
+        "id": str(uuid.uuid4()),
+        "title": req.title,
+        "description": req.description,
+        "type": req.type,
+        "status": "open",
+        "priority": req.priority,
+        "related_entity_type": req.related_entity_type,
+        "related_entity_id": req.related_entity_id,
+        "assigned_to": req.assigned_to or user.get("email"),
+        "due_date": req.due_date,
+        "source_event": f"manual:{uuid.uuid4()}",
+        "auto_generated": False,
+        "outcome": None,
+        "activity_history": [{"action": "created", "by": user.get("email"), "at": now}],
+        "created_by": user.get("email"),
+        "created_at": now,
+        "updated_at": now,
+    }
+    await db.tasks.insert_one(task_doc)
+    task_doc.pop("_id", None)
+    await db.events.insert_one({
+        "id": str(uuid.uuid4()),
+        "type": "task.created",
+        "entity_type": "task",
+        "entity_id": task_doc["id"],
+        "data": {"title": req.title, "type": req.type, "related": req.related_entity_id},
+        "created_at": now,
+    })
+    return {"data": task_doc}
+
+
+@api_router.get("/tasks/{task_id}")
+async def get_task(task_id: str, request: Request):
+    user = await get_current_user(request, db)
+    task = await db.tasks.find_one({"id": task_id}, {"_id": 0})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {"data": task}
+
+
+@api_router.put("/tasks/{task_id}")
+async def update_task(task_id: str, req: TaskUpdate, request: Request):
+    user = await get_current_user(request, db)
+    task = await db.tasks.find_one({"id": task_id}, {"_id": 0})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    now = datetime.now(timezone.utc).isoformat()
+    update_fields = {k: v for k, v in req.dict().items() if v is not None}
+    update_fields["updated_at"] = now
+    history_entry = {"action": "updated", "by": user.get("email"), "at": now, "changes": {k: v for k, v in update_fields.items() if k != "updated_at"}}
+    await db.tasks.update_one({"id": task_id}, {"$set": update_fields, "$push": {"activity_history": history_entry}})
+    task = await db.tasks.find_one({"id": task_id}, {"_id": 0})
+    return {"data": task}
+
+
+@api_router.post("/tasks/{task_id}/complete")
+async def complete_task(task_id: str, req: TaskComplete, request: Request):
+    user = await get_current_user(request, db)
+    task = await db.tasks.find_one({"id": task_id}, {"_id": 0})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    now = datetime.now(timezone.utc).isoformat()
+    history_entry = {"action": "completed", "by": user.get("email"), "at": now, "outcome": req.outcome}
+    await db.tasks.update_one(
+        {"id": task_id},
+        {"$set": {"status": "completed", "outcome": req.outcome, "completed_at": now, "updated_at": now}, "$push": {"activity_history": history_entry}},
+    )
+    await db.events.insert_one({
+        "id": str(uuid.uuid4()),
+        "type": "task.completed",
+        "entity_type": "task",
+        "entity_id": task_id,
+        "data": {"outcome": req.outcome, "by": user.get("email")},
+        "created_at": now,
+    })
+    task = await db.tasks.find_one({"id": task_id}, {"_id": 0})
+    return {"data": task}
+
+
+@api_router.delete("/tasks/{task_id}")
+async def delete_task(task_id: str, request: Request):
+    user = await get_current_user(request, db)
+    if user.get("role") not in ["super_admin", "marketing_admin"]:
+        raise HTTPException(status_code=403, detail="Only admins can delete tasks")
+    await db.tasks.delete_one({"id": task_id})
+    return {"message": "Task deleted"}
+
+
 # ==================== DASHBOARD ROUTES ====================
 
 @api_router.get("/dashboard")
@@ -2091,6 +2456,11 @@ async def get_dashboard(request: Request):
             "user_email": user_email,
             "overdue_payments": await db.billing_schedules.count_documents({"outstanding": {"$gt": 0}}),
             "pending_assignments": await db.leads.count_documents({"assigned_to": user_email, "assignment_status": "pending"}),
+            "my_tasks": {
+                "open": await db.tasks.count_documents({"assigned_to": user_email, "status": {"$in": ["open", "in_progress", "snoozed"]}}),
+                "overdue": await db.tasks.count_documents({"assigned_to": user_email, "status": {"$in": ["open", "in_progress", "snoozed"]}, "due_date": {"$lt": datetime.now(timezone.utc).isoformat()}}),
+                "completed": await db.tasks.count_documents({"assigned_to": user_email, "status": "completed"}),
+            },
         }
     }
     
@@ -2646,8 +3016,8 @@ app.add_middleware(
     allow_origins=[
         os.environ.get("FRONTEND_URL", "http://localhost:3000"),
         "http://localhost:3000",
-        "https://erp-sipro-rebuild.preview.emergentagent.com",
-        "https://sipro-dev-env.preview.emergentagent.com"
+        "https://sipro-tasks.preview.emergentagent.com",
+        "https://sipro-tasks.preview.emergentagent.com"
     ],
     allow_credentials=True,
     allow_methods=["*"],

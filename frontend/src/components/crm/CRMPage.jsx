@@ -8,6 +8,7 @@ import {
   Calendar, Handshake, UserPlus, UserCheck, X, Clock, Check,
   XCircle, ChevronRight, MessageCircle, Activity, History, Zap
 } from 'lucide-react';
+import { LeadTasksPanel } from '../tasks/TasksPage';
 
 const STAGE_CONFIG = {
   acquisition: { label: 'Akuisisi', color: '#2563eb', bg: 'rgba(37,99,235,0.08)', icon: Target },
@@ -388,6 +389,9 @@ export default function CRMPage() {
           </div>
 
           {selectedLead.notes && <div style={{ fontSize: 10, color: '#556680', background: 'rgba(0,0,0,0.02)', padding: 6, borderRadius: 6, marginBottom: 6 }}>{t('notes')}: {selectedLead.notes}</div>}
+
+          {/* Phase C: Tasks for this lead */}
+          <LeadTasksPanel leadId={selectedLead.id} leadName={selectedLead.name} currentUser={user} />
 
           {/* Timeline */}
           {showTimeline && (
