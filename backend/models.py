@@ -309,3 +309,40 @@ class CommissionPayout(BaseModel):
     payout_date: str
     reference: Optional[str] = None
     notes: Optional[str] = None
+
+
+# ---- Phase F1: Document Workflow ----
+class DocumentTemplateCreate(BaseModel):
+    code: str  # SPK, PPJB, AJB, BAST, CUSTOM
+    name: str
+    description: Optional[str] = None
+    content: str  # markdown/plain text with {{variable.path}} placeholders
+    variables: List[str] = []  # documented var list, e.g. ["customer.name", "unit.label"]
+    is_active: bool = True
+
+
+class DocumentTemplateUpdate(BaseModel):
+    code: Optional[str] = None
+    name: Optional[str] = None
+    description: Optional[str] = None
+    content: Optional[str] = None
+    variables: Optional[List[str]] = None
+    is_active: Optional[bool] = None
+
+
+class DocumentCreate(BaseModel):
+    template_id: str
+    deal_id: str
+    title: Optional[str] = None
+    overrides: Optional[dict] = None  # manual variable overrides
+
+
+class DocumentUpdate(BaseModel):
+    title: Optional[str] = None
+    content: Optional[str] = None  # only editable in draft status
+
+
+class DocumentSign(BaseModel):
+    role: str  # buyer, seller, witness
+    name: str
+    signature_image: str  # base64 data URL

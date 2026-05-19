@@ -20,6 +20,7 @@ import AppointmentsPage from './components/appointments/AppointmentsPage';
 import TasksPage from './components/tasks/TasksPage';
 import CustomersPage from './components/customers/CustomersPage';
 import CommissionsPage from './components/commissions/CommissionsPage';
+import DocumentsPage from './components/documents/DocumentsPage';
 import './App.css';
 
 function ProtectedRoute({ children }) {
@@ -68,6 +69,7 @@ function AppLayout() {
           <Route path="/tasks" element={<TasksPage />} />
           <Route path="/customers" element={<CustomersPage />} />
           <Route path="/commissions" element={<CommissionsPage />} />
+          <Route path="/documents" element={<DocumentsPage />} />
         </Routes>
       </div>
     </div>

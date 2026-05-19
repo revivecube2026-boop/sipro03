@@ -54,7 +54,7 @@ from routers import (
     tasks_router, customers_router, commissions_router,
     whatsapp_router, dev_report_router, siteplan_router,
     finance_router, construction_router, notifications_router,
-    dashboard_router,
+    dashboard_router, documents_router,
 )
 api_router.include_router(tasks_router.router)
 api_router.include_router(customers_router.router)
@@ -66,6 +66,7 @@ api_router.include_router(finance_router.router)
 api_router.include_router(construction_router.router)
 api_router.include_router(notifications_router.router)
 api_router.include_router(dashboard_router.router)
+api_router.include_router(documents_router.router)
 
 # ==================== AUTH ROUTES ====================
 
@@ -1828,6 +1829,13 @@ async def create_indexes():
     await db.commissions.create_index("deal_id", unique=True)
     await db.commissions.create_index("status")
     await db.commissions.create_index([("created_at", -1)])
+    # Phase F1: documents indexes
+    await db.document_templates.create_index("code")
+    await db.documents.create_index("deal_id")
+    await db.documents.create_index("customer_id")
+    await db.documents.create_index("template_code")
+    await db.documents.create_index("status")
+    await db.documents.create_index([("created_at", -1)])
     logger.info("Indexes ensured")
 
 async def migrate_lead_stages():
@@ -1917,6 +1925,10 @@ async def startup():
     await seed_admin()
     await seed_sample_data()
     await migrate_lead_stages()
+
+    # Phase F1: seed default document templates (SPK/PPJB/AJB/BAST)
+    from seed_documents import seed_default_templates
+    await seed_default_templates()
 
     # Phase D: start background reservation sweeper
     import asyncio
