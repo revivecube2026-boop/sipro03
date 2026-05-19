@@ -1,0 +1,42 @@
+{
+  "summary": "Phase D production hardening fully tested. Backend: 19/19 pytest cases pass (phone normalization E.164 incl. import + cross-format dedup, idempotent first_contacted_at/response_time_minutes across 2x nurturing transitions, strict RBAC scope for sales role on leads/tasks/appointments/deals plus 403 'Lead bukan milik Anda' for unowned lead GET, admin & marketing_admin no-scope, auto-assign returns load-balanced `loads` dict, atomic concurrent unit booking — exactly one of two parallel POST /api/deals succeeds & the other gets 400 'Unit is not available', deals reserved_until set ~7d, POST /api/deals/expire-reservations admin=200 sales=403, MongoDB indexes exist for tasks(source_event, related_entity_id, due_date)/deals.reserved_until/events.entity_id/appointments.lead_id, login cookies with HttpOnly+SameSite=Lax and NO Secure flag in dev, backfill verifies no leads have last_contacted_at!=None with first_contacted_at=None). Phase C regression: 19/19 task tests still pass. Frontend smoke: admin sees full dashboard + tasks page + CRM with 48 leads/4 owners; sales1 login OK, CRM lists exactly 10 leads all assigned to sales1@sipro.com (owners_count=1), phones normalized in UI, Indonesian labels intact.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_phase_d.py",
+    "/app/backend/tests/test_tasks.py",
+    "/app/test_reports/pytest/phase_d_results.xml",
+    "/app/test_reports/pytest/tasks_regression.xml"
+  ],
+  "action_items": [
+    "(Already fixed) migrate_lead_stages() had an early `return` when no leads were missing stage, which short-circuited the Phase D first_contacted_at backfill block. Removed the early-return so the backfill runs on every startup. Verified post-fix: 0 leads with last_contacted_at!=None and first_contacted_at=None."
+  ],
+  "critical_code_review_comments": [
+    "server.py is now 3222 lines — still monolithic; consider splitting routers (deals_router.py, leads_router.py, tasks_router.py) before further phases.",
+    "Auto-assign uses min(load, key=...) which is deterministic when multiple users tie on load — first-inserted-user wins. For very even loads this looks like round-robin to user A→A→B. Currently acceptable per spec ('lower load receives more') but worth noting.",
+    "`find_one_and_update` on units uses `return_document=False` (BEFORE doc) for atomic hold — correct pattern; just be aware unit.label/status reflect pre-hold values.",
+    "Cookies are set with SameSite=Lax + Secure=False in dev. In production COOKIE_SECURE=true will flip to SameSite=None + Secure=True (cross-site safe). Verify frontend will use credentials:'include' on prod fetches.",
+    "Phone normalizer treats any unknown prefix as `+`+digits which may produce invalid E.164 for non-ID numbers. Consider rejecting or logging non-Indonesian formats."
+  ],
+  "updated_files": [
+    "/app/backend/server.py (migrate_lead_stages: removed early-return that skipped Phase D first_contacted_at backfill)",
+    "/app/backend/tests/test_phase_d.py (new — 19 Phase D test cases)"
+  ],
+  "success_rate": {
+    "backend": "100% (19/19 Phase D + 19/19 Phase C regression)",
+    "frontend": "100% (admin dashboard/tasks/CRM + sales1 RBAC verified)"
+  },
+  "test_credentials": "admin@sipro.com/admin123 (super_admin), sales1@sipro.com/sipro123 (sales), sales2@sipro.com/sipro123, marketing_admin@sipro.com/sipro123, finance@sipro.com/sipro123 — all confirmed working",
+  "seed_data_creation": "Created TEST_-prefixed leads (TEST_phone_local, TEST_dedup_a/b, TEST_import_phone, TEST_idem_rt, TEST_rbac_admin_lead, TEST_auto_0..2), one TEST_proj_phaseD project, several TEST_U_* units, and concurrent-test deals (TEST_cc_*). All TEST_-prefixed for easy cleanup. Phone numbers randomized to avoid dedup collisions.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Phase D verified end-to-end. The Phase D first_contacted_at backfill bug was found and fixed in server.py:3094-3096 (early return removed; backfill now always runs on startup). If you re-run Phase D tests after wiping seed data they will pass cleanly. Test file /app/backend/tests/test_phase_d.py covers all hardening requirements; /app/backend/tests/test_tasks.py is the Phase C regression suite. Both pass 100%. RBAC: sales1 owns 10 leads in current DB (admin/test setup created extras during testing). Atomic booking test creates a fresh TEST_ unit each run so it's idempotent. Cookie security check inspects only access_token/refresh_token cookies (ignoring Cloudflare's __cf_bm).",
+  "rca of the issue": "BUG: migrate_lead_stages() had `if leads_without_stage == 0: return` at the top, which short-circuited execution once stages were already migrated on a previous startup. Because the Phase D `first_contacted_at` backfill code block was added LATER in the same function but AFTER that early return, it never ran on databases that had already been through Phase B stage migration. Symptom: seeded leads (created by seed_sample_data with last_contacted_at!=None but no first_contacted_at field) remained with the field missing forever. FIX: removed the early `return` and only kept the conditional log message. Result: backfill matches 4 docs on startup and modifies them; verified DB has 0 offenders after backend restart. REPRODUCTION: start with non-empty leads collection where all docs have `stage` set but some are missing `first_contacted_at`; restart backend → field still missing. MITIGATION: removed early return; future migrations should each be guarded independently rather than relying on a single function-wide guard."
+}

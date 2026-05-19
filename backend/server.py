@@ -28,12 +28,75 @@ mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
+# Phase D: configurable security & business policy
+COOKIE_SECURE = os.environ.get('COOKIE_SECURE', 'false').lower() == 'true'
+COOKIE_SAMESITE = 'none' if COOKIE_SECURE else 'lax'
+BOOKING_HOLD_DAYS = int(os.environ.get('BOOKING_HOLD_DAYS', '7'))
+
 app = FastAPI(title="SIPRO - Property Development OS")
 api_router = APIRouter(prefix="/api")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# ==================== PHASE D: SHARED HELPERS ====================
+import re as _re
+
+def _normalize_phone(phone: Optional[str]) -> Optional[str]:
+    """Normalize Indonesian phone numbers to E.164 (+62...). Idempotent."""
+    if not phone:
+        return None
+    digits = _re.sub(r'[^\d+]', '', phone.strip())
+    if not digits:
+        return None
+    if digits.startswith('+'):
+        return digits
+    if digits.startswith('62'):
+        return '+' + digits
+    if digits.startswith('0'):
+        return '+62' + digits[1:]
+    if digits.startswith('8'):
+        return '+62' + digits
+    return '+' + digits
+
+# Phase D: role-based data scoping helpers (strict RBAC)
+SCOPED_ROLES = {"sales", "marketing_inhouse"}  # only see their own assigned items
+
+def _apply_lead_scope(user: dict, query: dict) -> dict:
+    """Restrict lead query for scoped roles to leads assigned to the user."""
+    if user.get("role") in SCOPED_ROLES:
+        query = {**query, "assigned_to": user.get("email")}
+    return query
+
+def _apply_task_scope(user: dict, query: dict) -> dict:
+    if user.get("role") in SCOPED_ROLES:
+        query = {**query, "assigned_to": user.get("email")}
+    return query
+
+def _apply_appointment_scope(user: dict, query: dict) -> dict:
+    if user.get("role") in SCOPED_ROLES:
+        query = {**query, "assigned_to": user.get("email")}
+    return query
+
+def _can_access_lead(user: dict, lead: dict) -> bool:
+    if user.get("role") not in SCOPED_ROLES:
+        return True
+    return lead.get("assigned_to") == user.get("email")
+
+def _set_auth_cookies(response: Response, access_token: str, refresh_token: Optional[str] = None):
+    """Set cookies with environment-aware security flags."""
+    response.set_cookie(
+        key="access_token", value=access_token,
+        httponly=True, secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE,
+        max_age=86400, path="/",
+    )
+    if refresh_token:
+        response.set_cookie(
+            key="refresh_token", value=refresh_token,
+            httponly=True, secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE,
+            max_age=604800, path="/",
+        )
 
 # ==================== PYDANTIC MODELS ====================
 
@@ -256,9 +319,7 @@ async def register(req: RegisterRequest, response: Response):
     
     access_token = create_access_token(user_id, email, req.role)
     refresh_token = create_refresh_token(user_id)
-    
-    response.set_cookie(key="access_token", value=access_token, httponly=True, secure=False, samesite="lax", max_age=86400, path="/")
-    response.set_cookie(key="refresh_token", value=refresh_token, httponly=True, secure=False, samesite="lax", max_age=604800, path="/")
+    _set_auth_cookies(response, access_token, refresh_token)
     
     return {"id": user_id, "email": email, "name": req.name, "role": req.role, "token": access_token}
 
@@ -293,9 +354,7 @@ async def login(req: LoginRequest, request: Request, response: Response):
     user_id = str(user["_id"])
     access_token = create_access_token(user_id, email, user.get("role", "user"))
     refresh_token = create_refresh_token(user_id)
-    
-    response.set_cookie(key="access_token", value=access_token, httponly=True, secure=False, samesite="lax", max_age=86400, path="/")
-    response.set_cookie(key="refresh_token", value=refresh_token, httponly=True, secure=False, samesite="lax", max_age=604800, path="/")
+    _set_auth_cookies(response, access_token, refresh_token)
     
     return {
         "id": user_id, "email": user["email"], "name": user.get("name", ""),
@@ -327,7 +386,7 @@ async def refresh_token(request: Request, response: Response):
             raise HTTPException(status_code=401, detail="User not found")
         user_id = str(user["_id"])
         access_token = create_access_token(user_id, user["email"], user.get("role", "user"))
-        response.set_cookie(key="access_token", value=access_token, httponly=True, secure=False, samesite="lax", max_age=86400, path="/")
+        _set_auth_cookies(response, access_token)
         return {"message": "Token refreshed", "token": access_token}
     except pyjwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Refresh token expired")
@@ -563,7 +622,10 @@ async def list_leads(
             {"phone": {"$regex": search, "$options": "i"}},
             {"email": {"$regex": search, "$options": "i"}}
         ]
-    
+
+    # Phase D: enforce strict RBAC scope for sales/marketing_inhouse
+    query = _apply_lead_scope(user, query)
+
     total = await db.leads.count_documents(query)
     leads = await db.leads.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
     
@@ -582,6 +644,7 @@ async def get_lead_pipeline_inline(request: Request, project_id: Optional[str] =
     query = {}
     if project_id:
         query["project_id"] = project_id
+    query = _apply_lead_scope(user, query)
     stages = ["acquisition", "nurturing", "appointment", "booking", "recycle"]
     pipeline_data = {}
     for stage in stages:
@@ -639,21 +702,24 @@ async def get_lead_response_stats(request: Request):
 @api_router.post("/leads")
 async def create_lead(req: LeadCreate, request: Request):
     user = await get_current_user(request, db)
-    
+
+    # Phase D: normalize phone to E.164 for consistent dedup & WA matching
+    normalized_phone = _normalize_phone(req.phone)
+
     # Duplicate check
-    if req.phone:
-        dup = await db.leads.find_one({"phone": req.phone})
+    if normalized_phone:
+        dup = await db.leads.find_one({"phone": normalized_phone})
         if dup:
-            raise HTTPException(status_code=400, detail=f"Lead with phone {req.phone} already exists")
+            raise HTTPException(status_code=400, detail=f"Lead with phone {normalized_phone} already exists")
     if req.email:
         dup = await db.leads.find_one({"email": req.email.lower()})
         if dup:
             raise HTTPException(status_code=400, detail=f"Lead with email {req.email} already exists")
-    
+
     lead_doc = {
         "id": str(uuid.uuid4()),
         "name": req.name,
-        "phone": req.phone,
+        "phone": normalized_phone,
         "email": req.email.lower() if req.email else None,
         "source": req.source,
         "campaign": req.campaign,
@@ -667,6 +733,7 @@ async def create_lead(req: LeadCreate, request: Request):
         "quality_score": 0,
         "follow_up_count": 0,
         "last_contacted_at": None,
+        "first_contacted_at": None,  # Phase D: for idempotent response time
         "nurturing_outcome": None,
         "created_by": user.get("email"),
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -769,6 +836,8 @@ async def get_lead(lead_id: str, request: Request):
     lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
+    if not _can_access_lead(user, lead):
+        raise HTTPException(status_code=403, detail="Lead bukan milik Anda")
     activities = await db.lead_activities.find({"lead_id": lead_id}, {"_id": 0}).sort("created_at", -1).to_list(50)
     appointments = await db.appointments.find({"lead_id": lead_id}, {"_id": 0}).sort("scheduled_at", -1).to_list(20)
     return {"data": {**lead, "activities": activities, "appointments": appointments}}
@@ -806,7 +875,7 @@ async def import_leads(request: Request):
     for idx, lead_data in enumerate(leads_data):
         try:
             name = lead_data.get("name", "").strip()
-            phone = lead_data.get("phone", "").strip()
+            phone = _normalize_phone(lead_data.get("phone", ""))
             email = (lead_data.get("email", "") or "").lower().strip()
             
             if not name:
@@ -843,6 +912,7 @@ async def import_leads(request: Request):
                 "quality_score": 0,
                 "follow_up_count": 0,
                 "last_contacted_at": None,
+                "first_contacted_at": None,
                 "nurturing_outcome": None,
                 "import_batch": body.get("batch_id", str(uuid.uuid4())),
                 "created_by": user.get("email"),
@@ -918,63 +988,71 @@ async def assign_leads(req: LeadAssignRequest, request: Request):
 
 @api_router.post("/leads/auto-assign")
 async def auto_assign_leads(request: Request):
-    """Round-robin auto-assign unassigned leads to marketing inhouse users"""
+    """Phase D: load-balanced auto-assign — picks user with lowest current open load each iter."""
     user = await get_current_user(request, db)
     body = await request.json()
     stage = body.get("stage", "acquisition")
-    role_filter = body.get("role", "sales")
     now = datetime.now(timezone.utc).isoformat()
-    
+
     # Get eligible users (marketing inhouse / sales)
     eligible_roles = ["sales", "marketing_inhouse"]
     eligible_users = await db.users.find(
         {"role": {"$in": eligible_roles}, "status": "active"},
         {"_id": 0, "email": 1, "name": 1}
     ).to_list(100)
-    
+
     if not eligible_users:
         raise HTTPException(status_code=400, detail="No eligible users for auto-assignment")
-    
+
+    # Compute current load per user (open leads not in recycle)
+    load: dict = {}
+    for u in eligible_users:
+        load[u["email"]] = await db.leads.count_documents({
+            "assigned_to": u["email"],
+            "stage": {"$nin": ["recycle"]},
+        })
+
     # Get unassigned leads in the specified stage
     unassigned = await db.leads.find(
         {"$or": [{"assigned_to": None}, {"assigned_to": ""}], "stage": stage},
         {"_id": 0, "id": 1}
     ).to_list(500)
-    
+
     if not unassigned:
         return {"data": {"assigned": 0, "message": "No unassigned leads found"}}
-    
-    # Round-robin assignment
+
+    # Load-balanced assignment: each iter pick the user with the lowest load
     assigned_count = 0
-    for i, lead in enumerate(unassigned):
-        target = eligible_users[i % len(eligible_users)]
+    for lead in unassigned:
+        target_email = min(load, key=lambda e: load[e])
         history_entry = {
             "from": None,
-            "to": target["email"],
+            "to": target_email,
             "assigned_by": "system:auto-assign",
-            "reason": "Round-robin auto-assignment",
+            "reason": "Load-balanced auto-assignment",
             "action": "auto_assigned",
-            "timestamp": now
+            "timestamp": now,
         }
         await db.leads.update_one({"id": lead["id"]}, {
             "$set": {
-                "assigned_to": target["email"],
+                "assigned_to": target_email,
                 "assignment_status": "pending",
-                "updated_at": now
+                "updated_at": now,
             },
             "$push": {"assignment_history": history_entry}
         })
+        load[target_email] += 1
         await db.events.insert_one({
             "id": str(uuid.uuid4()),
             "type": "lead.auto_assigned",
             "entity_type": "lead",
             "entity_id": lead["id"],
-            "data": {"to": target["email"], "method": "round_robin"},
-            "created_at": now
+            "data": {"to": target_email, "method": "load_balanced"},
+            "created_at": now,
         })
         assigned_count += 1
-    
-    return {"data": {"assigned": assigned_count, "users": [u["email"] for u in eligible_users]}}
+
+    return {"data": {"assigned": assigned_count, "loads": load}}
 
 @api_router.post("/leads/{lead_id}/assignment/respond")
 async def respond_to_assignment(lead_id: str, req: LeadAssignmentResponse, request: Request):
@@ -1066,16 +1144,18 @@ async def transition_lead_stage(lead_id: str, request: Request):
         update_fields["status"] = "contacted"
         update_fields["last_contacted_at"] = now
         update_fields["follow_up_count"] = (lead.get("follow_up_count") or 0) + 1
-        # Compute response time
-        created_at = lead.get("created_at")
-        if created_at:
-            try:
-                created_dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-                now_dt = datetime.now(timezone.utc)
-                response_minutes = int((now_dt - created_dt).total_seconds() / 60)
-                update_fields["response_time_minutes"] = response_minutes
-            except Exception:
-                pass
+        # Phase D: idempotent response time — compute once when first_contacted_at is None
+        if not lead.get("first_contacted_at"):
+            update_fields["first_contacted_at"] = now
+            created_at = lead.get("created_at")
+            if created_at:
+                try:
+                    created_dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                    now_dt = datetime.now(timezone.utc)
+                    response_minutes = int((now_dt - created_dt).total_seconds() / 60)
+                    update_fields["response_time_minutes"] = response_minutes
+                except Exception:
+                    pass
     
     # Map stage to compatible status for backward compatibility
     stage_to_status = {"acquisition": "new", "nurturing": "contacted", "appointment": "prospect", "booking": "prospect", "recycle": "no_response"}
@@ -1190,6 +1270,7 @@ async def list_appointments(request: Request, status: Optional[str] = None):
     query = {}
     if status:
         query["status"] = status
+    query = _apply_appointment_scope(user, query)
     appointments = await db.appointments.find(query, {"_id": 0}).sort("scheduled_at", -1).to_list(100)
     return {"data": appointments}
 
@@ -1267,7 +1348,10 @@ async def list_deals(
             {"customer_name": {"$regex": search, "$options": "i"}},
             {"customer_phone": {"$regex": search, "$options": "i"}}
         ]
-    
+    # Phase D: scope deals by created_by for sales role (best-effort)
+    if user.get("role") in SCOPED_ROLES:
+        query["created_by"] = user.get("email")
+
     total = await db.deals.count_documents(query)
     deals = await db.deals.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
     return {"data": deals, "total": total}
@@ -1275,20 +1359,32 @@ async def list_deals(
 @api_router.post("/deals")
 async def create_deal(req: DealCreate, request: Request):
     user = await get_current_user(request, db)
-    
-    # Check unit availability
-    unit = await db.units.find_one({"id": req.unit_id}, {"_id": 0})
-    if not unit:
-        raise HTTPException(status_code=404, detail="Unit not found")
-    if unit.get("status") not in ["available", None]:
-        raise HTTPException(status_code=400, detail=f"Unit is not available (current: {unit.get('status')})")
-    
+
+    # Phase D: atomic unit hold to prevent double-booking race
+    hold_result = await db.units.find_one_and_update(
+        {"id": req.unit_id, "status": {"$in": ["available", None]}},
+        {"$set": {"status": "holding", "deal_status": "draft", "updated_at": datetime.now(timezone.utc).isoformat()}},
+        return_document=False,
+        projection={"_id": 0},
+    )
+    if not hold_result:
+        # Either not found or not available
+        existing = await db.units.find_one({"id": req.unit_id}, {"_id": 0, "id": 1, "status": 1})
+        if not existing:
+            raise HTTPException(status_code=404, detail="Unit not found")
+        raise HTTPException(status_code=400, detail=f"Unit is not available (current: {existing.get('status')})")
+    unit = hold_result  # unit doc before update
+
+    # Phase D: Booking hold timer
+    from datetime import timedelta
+    reserved_until = (datetime.now(timezone.utc) + timedelta(days=BOOKING_HOLD_DAYS)).isoformat()
+
     deal_doc = {
         "id": str(uuid.uuid4()),
         "lead_id": req.lead_id,
         "customer_name": req.customer_name,
         "customer_email": req.customer_email,
-        "customer_phone": req.customer_phone,
+        "customer_phone": _normalize_phone(req.customer_phone),
         "unit_id": req.unit_id,
         "unit_label": unit.get("label", ""),
         "project_id": req.project_id,
@@ -1296,23 +1392,24 @@ async def create_deal(req: DealCreate, request: Request):
         "payment_method": req.payment_method,
         "notes": req.notes,
         "status": "draft",
+        "reserved_until": reserved_until,
         "created_by": user.get("email"),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat()
     }
     await db.deals.insert_one(deal_doc)
     deal_doc.pop("_id", None)
-    
+
     # Log event
     await db.events.insert_one({
         "id": str(uuid.uuid4()),
         "type": "deal.created",
         "entity_type": "deal",
         "entity_id": deal_doc["id"],
-        "data": {"customer": req.customer_name, "unit": unit.get("label")},
+        "data": {"customer": req.customer_name, "unit": unit.get("label"), "reserved_until": reserved_until},
         "created_at": datetime.now(timezone.utc).isoformat()
     })
-    
+
     return {"data": deal_doc}
 
 @api_router.put("/deals/{deal_id}")
@@ -1367,12 +1464,51 @@ async def reserve_deal(deal_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Deal not found")
     if deal["status"] != "draft":
         raise HTTPException(status_code=400, detail="Can only reserve from draft status")
-    
-    await db.deals.update_one({"id": deal_id}, {"$set": {"status": "reserved", "reserved_at": datetime.now(timezone.utc).isoformat()}})
+
+    # Phase D: reserved_until hold timer
+    from datetime import timedelta
+    now_iso = datetime.now(timezone.utc).isoformat()
+    reserved_until = (datetime.now(timezone.utc) + timedelta(days=BOOKING_HOLD_DAYS)).isoformat()
+    await db.deals.update_one({"id": deal_id}, {"$set": {
+        "status": "reserved", "reserved_at": now_iso, "reserved_until": reserved_until, "updated_at": now_iso,
+    }})
     await db.units.update_one({"id": deal["unit_id"]}, {"$set": {"status": "reserved", "deal_status": "reserved"}})
-    
+
     deal = await db.deals.find_one({"id": deal_id}, {"_id": 0})
     return {"data": deal}
+
+@api_router.post("/deals/expire-reservations")
+async def expire_reservations(request: Request):
+    """Phase D: release expired reservations (callable manually or via cron/sweeper).
+
+    A deal in 'draft' or 'reserved' whose `reserved_until` < now is released:
+    deal.status = 'expired', unit.status reverts to 'available'.
+    """
+    user = await get_current_user(request, db)
+    if user.get("role") not in ["super_admin", "marketing_admin", "management"]:
+        raise HTTPException(status_code=403, detail="Only admins can expire reservations")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    expired_deals = await db.deals.find(
+        {"status": {"$in": ["draft", "reserved"]}, "reserved_until": {"$lt": now_iso, "$ne": None}},
+        {"_id": 0},
+    ).to_list(500)
+    released = []
+    for d in expired_deals:
+        await db.deals.update_one({"id": d["id"]}, {"$set": {"status": "expired", "expired_at": now_iso, "updated_at": now_iso}})
+        await db.units.update_one(
+            {"id": d["unit_id"], "status": {"$in": ["holding", "reserved", "booked"]}},
+            {"$set": {"status": "available", "deal_status": None, "updated_at": now_iso}},
+        )
+        await db.events.insert_one({
+            "id": str(uuid.uuid4()),
+            "type": "deal.expired",
+            "entity_type": "deal",
+            "entity_id": d["id"],
+            "data": {"reserved_until": d.get("reserved_until")},
+            "created_at": now_iso,
+        })
+        released.append({"deal_id": d["id"], "unit_id": d["unit_id"]})
+    return {"data": {"released": len(released), "items": released}}
 
 @api_router.post("/deals/{deal_id}/booking")
 async def book_deal(deal_id: str, request: Request):
@@ -2186,6 +2322,8 @@ async def list_tasks(
     if overdue:
         query["due_date"] = {"$lt": datetime.now(timezone.utc).isoformat()}
         query["status"] = {"$in": ["open", "in_progress", "snoozed"]}
+    # Phase D: enforce scope
+    query = _apply_task_scope(user, query)
     total = await db.tasks.count_documents(query)
     tasks = await db.tasks.find(query, {"_id": 0}).sort("due_date", 1).skip(skip).limit(limit).to_list(limit)
     # Enrich with related lead names where applicable
@@ -2926,7 +3064,9 @@ async def create_indexes():
     await db.deals.create_index("project_id")
     await db.deals.create_index("status")
     await db.deals.create_index("unit_id")
+    await db.deals.create_index("reserved_until")  # Phase D: sweep expired
     await db.events.create_index([("created_at", -1)])
+    await db.events.create_index("entity_id")  # Phase D
     await db.login_attempts.create_index("identifier")
     await db.billing_schedules.create_index("deal_id")
     await db.payments.create_index("deal_id")
@@ -2935,16 +3075,25 @@ async def create_indexes():
     await db.notifications.create_index([("created_at", -1)])
     await db.notifications.create_index("target_user")
     await db.appointments.create_index("scheduled_at")
+    await db.appointments.create_index("lead_id")  # Phase D
+    await db.appointments.create_index("assigned_to")  # Phase D
+    # Phase C: tasks indexes
+    await db.tasks.create_index("status")
+    await db.tasks.create_index("assigned_to")
+    await db.tasks.create_index("type")
+    await db.tasks.create_index("due_date")
+    await db.tasks.create_index("related_entity_id")
+    await db.tasks.create_index("source_event")
+    await db.tasks.create_index([("created_at", -1)])
+    logger.info("Indexes ensured")
 
 async def migrate_lead_stages():
     """Non-destructive migration: populate stage for leads that don't have it"""
     status_to_stage_map = {"new": "acquisition", "contacted": "nurturing", "prospect": "appointment", "no_response": "recycle", "lost": "recycle"}
     
     leads_without_stage = await db.leads.count_documents({"$or": [{"stage": {"$exists": False}}, {"stage": None}]})
-    if leads_without_stage == 0:
-        return
-    
-    logger.info(f"Migrating {leads_without_stage} leads to add stage field")
+    if leads_without_stage > 0:
+        logger.info(f"Migrating {leads_without_stage} leads to add stage field")
     
     for status_val, stage_val in status_to_stage_map.items():
         result = await db.leads.update_many(
@@ -2975,6 +3124,47 @@ async def migrate_lead_stages():
         {"nurturing_outcome": {"$exists": False}},
         {"$set": {"nurturing_outcome": None}}
     )
+    # Phase D: backfill first_contacted_at from last_contacted_at
+    await db.leads.update_many(
+        {"first_contacted_at": {"$exists": False}, "last_contacted_at": {"$ne": None}},
+        [{"$set": {"first_contacted_at": "$last_contacted_at"}}],  # aggregation pipeline update
+    )
+    await db.leads.update_many(
+        {"first_contacted_at": {"$exists": False}},
+        {"$set": {"first_contacted_at": None}}
+    )
+
+
+async def _reservation_sweeper():
+    """Phase D: background task that releases expired draft/reserved deals."""
+    import asyncio
+    await asyncio.sleep(60)  # initial delay
+    while True:
+        try:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            expired = await db.deals.find(
+                {"status": {"$in": ["draft", "reserved"]}, "reserved_until": {"$lt": now_iso, "$ne": None}},
+                {"_id": 0, "id": 1, "unit_id": 1, "reserved_until": 1},
+            ).to_list(200)
+            for d in expired:
+                await db.deals.update_one({"id": d["id"]}, {"$set": {"status": "expired", "expired_at": now_iso, "updated_at": now_iso}})
+                await db.units.update_one(
+                    {"id": d["unit_id"], "status": {"$in": ["holding", "reserved", "booked"]}},
+                    {"$set": {"status": "available", "deal_status": None, "updated_at": now_iso}},
+                )
+                await db.events.insert_one({
+                    "id": str(uuid.uuid4()),
+                    "type": "deal.expired",
+                    "entity_type": "deal",
+                    "entity_id": d["id"],
+                    "data": {"reserved_until": d.get("reserved_until"), "by": "system:sweeper"},
+                    "created_at": now_iso,
+                })
+            if expired:
+                logger.info(f"Reservation sweeper released {len(expired)} expired deals")
+        except Exception as e:
+            logger.error(f"Reservation sweeper error: {e}")
+        await asyncio.sleep(900)  # every 15 min
 
 # ==================== APP SETUP ====================
 
@@ -2984,6 +3174,10 @@ async def startup():
     await seed_admin()
     await seed_sample_data()
     await migrate_lead_stages()
+
+    # Phase D: start background reservation sweeper
+    import asyncio
+    asyncio.create_task(_reservation_sweeper())
     
     # Write test credentials
     creds_dir = Path("/app/memory")
