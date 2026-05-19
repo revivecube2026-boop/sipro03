@@ -296,6 +296,82 @@ class TaskComplete(BaseModel):
 class TaskPermissionsUpdate(BaseModel):
     allowed_roles: List[str] = ["super_admin", "marketing_admin", "marketing_inhouse", "sales"]
 
+# ---- Phase E: Customer & Commission Models ----
+class CustomerCreate(BaseModel):
+    name: str
+    nik: Optional[str] = None  # KTP number 16 digits
+    npwp: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    birthplace: Optional[str] = None
+    birthdate: Optional[str] = None
+    gender: Optional[str] = None  # male, female
+    marital_status: Optional[str] = None  # single, married, divorced, widowed
+    address: Optional[str] = None
+    city: Optional[str] = None
+    province: Optional[str] = None
+    postal_code: Optional[str] = None
+    occupation: Optional[str] = None
+    company: Optional[str] = None
+    monthly_income: Optional[float] = None
+    spouse_name: Optional[str] = None
+    spouse_nik: Optional[str] = None
+    spouse_phone: Optional[str] = None
+    heir_name: Optional[str] = None
+    heir_relation: Optional[str] = None
+    heir_phone: Optional[str] = None
+    notes: Optional[str] = None
+
+class CustomerUpdate(BaseModel):
+    name: Optional[str] = None
+    nik: Optional[str] = None
+    npwp: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    birthplace: Optional[str] = None
+    birthdate: Optional[str] = None
+    gender: Optional[str] = None
+    marital_status: Optional[str] = None
+    address: Optional[str] = None
+    city: Optional[str] = None
+    province: Optional[str] = None
+    postal_code: Optional[str] = None
+    occupation: Optional[str] = None
+    company: Optional[str] = None
+    monthly_income: Optional[float] = None
+    spouse_name: Optional[str] = None
+    spouse_nik: Optional[str] = None
+    spouse_phone: Optional[str] = None
+    heir_name: Optional[str] = None
+    heir_relation: Optional[str] = None
+    heir_phone: Optional[str] = None
+    notes: Optional[str] = None
+
+class CommissionRuleCreate(BaseModel):
+    name: str
+    project_id: Optional[str] = None  # None = applies to all
+    role: Optional[str] = None         # None = applies to all roles
+    rate_type: str = "percent"         # percent | flat | tier
+    rate_value: float = 0              # for percent: e.g. 2.5; for flat: amount in IDR
+    tiers: Optional[List[dict]] = None  # [{min_amount, max_amount, rate}]
+    is_active: bool = True
+    priority: int = 0  # higher overrides lower
+
+class CommissionRuleUpdate(BaseModel):
+    name: Optional[str] = None
+    project_id: Optional[str] = None
+    role: Optional[str] = None
+    rate_type: Optional[str] = None
+    rate_value: Optional[float] = None
+    tiers: Optional[List[dict]] = None
+    is_active: Optional[bool] = None
+    priority: Optional[int] = None
+
+class CommissionPayout(BaseModel):
+    payout_date: str
+    reference: Optional[str] = None
+    notes: Optional[str] = None
+
 # ==================== AUTH ROUTES ====================
 
 @api_router.post("/auth/register")
@@ -1400,13 +1476,19 @@ async def create_deal(req: DealCreate, request: Request):
     await db.deals.insert_one(deal_doc)
     deal_doc.pop("_id", None)
 
+    # Phase E: link or create customer
+    cust_id = await _find_or_create_customer_from_deal(deal_doc, user.get("email"))
+    if cust_id:
+        await db.deals.update_one({"id": deal_doc["id"]}, {"$set": {"customer_id": cust_id}})
+        deal_doc["customer_id"] = cust_id
+
     # Log event
     await db.events.insert_one({
         "id": str(uuid.uuid4()),
         "type": "deal.created",
         "entity_type": "deal",
         "entity_id": deal_doc["id"],
-        "data": {"customer": req.customer_name, "unit": unit.get("label"), "reserved_until": reserved_until},
+        "data": {"customer": req.customer_name, "unit": unit.get("label"), "reserved_until": reserved_until, "customer_id": cust_id},
         "created_at": datetime.now(timezone.utc).isoformat()
     })
 
@@ -1453,7 +1535,11 @@ async def update_deal(deal_id: str, request: Request):
             "data": {"from": old_deal.get("status"), "to": new_status},
             "created_at": datetime.now(timezone.utc).isoformat()
         })
-    
+
+        # Phase E: auto-create commission when deal becomes booked
+        if new_status == "booked":
+            await _auto_create_commission(deal, user.get("email"))
+
     return {"data": deal}
 
 @api_router.post("/deals/{deal_id}/reserve")
@@ -1518,11 +1604,14 @@ async def book_deal(deal_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Deal not found")
     if deal["status"] not in ["draft", "reserved"]:
         raise HTTPException(status_code=400, detail="Can only book from draft or reserved status")
-    
-    await db.deals.update_one({"id": deal_id}, {"$set": {"status": "booked", "booked_at": datetime.now(timezone.utc).isoformat()}})
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    await db.deals.update_one({"id": deal_id}, {"$set": {"status": "booked", "booked_at": now_iso, "updated_at": now_iso}})
     await db.units.update_one({"id": deal["unit_id"]}, {"$set": {"status": "booked", "deal_status": "booked"}})
-    
+
     deal = await db.deals.find_one({"id": deal_id}, {"_id": 0})
+    # Phase E: auto-commission
+    await _auto_create_commission(deal, user.get("email"))
     return {"data": deal}
 
 # ==================== WHATSAPP ROUTES ====================
@@ -2483,6 +2572,358 @@ async def delete_task(task_id: str, request: Request):
     return {"message": "Task deleted"}
 
 
+# ==================== PHASE E: CUSTOMER & COMMISSION ====================
+
+async def _normalize_nik(nik: Optional[str]) -> Optional[str]:
+    if not nik:
+        return None
+    digits = _re.sub(r'\D', '', nik)
+    return digits or None
+
+async def _find_or_create_customer_from_deal(deal: dict, user_email: str) -> Optional[str]:
+    """Phase E: returns customer_id. Lookup by phone (E.164), else create new minimal customer doc."""
+    phone = _normalize_phone(deal.get("customer_phone"))
+    name = deal.get("customer_name")
+    if not phone and not name:
+        return None
+    query = {}
+    if phone:
+        query["phone"] = phone
+    elif name:
+        query["name"] = name
+    existing = await db.customers.find_one(query, {"_id": 0, "id": 1})
+    if existing:
+        return existing["id"]
+    now = datetime.now(timezone.utc).isoformat()
+    cust = {
+        "id": str(uuid.uuid4()),
+        "name": name,
+        "phone": phone,
+        "email": (deal.get("customer_email") or "").lower() or None,
+        "created_from": "deal_auto",
+        "created_by": user_email,
+        "created_at": now,
+        "updated_at": now,
+    }
+    await db.customers.insert_one(cust)
+    logger.info(f"Auto-created customer for deal {deal.get('id')}: {cust['id']}")
+    return cust["id"]
+
+
+@api_router.get("/customers")
+async def list_customers(request: Request, search: Optional[str] = None, skip: int = 0, limit: int = 50):
+    await get_current_user(request, db)
+    query: dict = {}
+    if search:
+        query["$or"] = [
+            {"name": {"$regex": search, "$options": "i"}},
+            {"phone": {"$regex": search, "$options": "i"}},
+            {"email": {"$regex": search, "$options": "i"}},
+            {"nik": {"$regex": search, "$options": "i"}},
+        ]
+    total = await db.customers.count_documents(query)
+    items = await db.customers.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+    # enrich each with deal count
+    for c in items:
+        c["deal_count"] = await db.deals.count_documents({"customer_id": c["id"]})
+    return {"data": items, "total": total}
+
+
+@api_router.post("/customers")
+async def create_customer(req: CustomerCreate, request: Request):
+    user = await get_current_user(request, db)
+    phone = _normalize_phone(req.phone)
+    nik = await _normalize_nik(req.nik)
+    if phone:
+        dup = await db.customers.find_one({"phone": phone}, {"_id": 0, "id": 1})
+        if dup:
+            raise HTTPException(status_code=400, detail=f"Customer with phone {phone} already exists")
+    if nik:
+        dup = await db.customers.find_one({"nik": nik}, {"_id": 0, "id": 1})
+        if dup:
+            raise HTTPException(status_code=400, detail=f"Customer with NIK {nik} already exists")
+    now = datetime.now(timezone.utc).isoformat()
+    doc = req.dict()
+    doc["phone"] = phone
+    doc["nik"] = nik
+    doc["spouse_phone"] = _normalize_phone(req.spouse_phone)
+    doc["heir_phone"] = _normalize_phone(req.heir_phone)
+    doc["email"] = (req.email or "").lower() or None
+    doc["id"] = str(uuid.uuid4())
+    doc["created_from"] = "manual"
+    doc["created_by"] = user.get("email")
+    doc["created_at"] = now
+    doc["updated_at"] = now
+    await db.customers.insert_one(doc)
+    doc.pop("_id", None)
+    return {"data": doc}
+
+
+@api_router.get("/customers/{customer_id}")
+async def get_customer(customer_id: str, request: Request):
+    await get_current_user(request, db)
+    c = await db.customers.find_one({"id": customer_id}, {"_id": 0})
+    if not c:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    deals = await db.deals.find({"customer_id": customer_id}, {"_id": 0}).sort("created_at", -1).to_list(50)
+    return {"data": {**c, "deals": deals}}
+
+
+@api_router.put("/customers/{customer_id}")
+async def update_customer(customer_id: str, req: CustomerUpdate, request: Request):
+    user = await get_current_user(request, db)
+    existing = await db.customers.find_one({"id": customer_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    update_fields = {k: v for k, v in req.dict().items() if v is not None}
+    if "phone" in update_fields:
+        update_fields["phone"] = _normalize_phone(update_fields["phone"])
+    if "nik" in update_fields:
+        update_fields["nik"] = await _normalize_nik(update_fields["nik"])
+    if "spouse_phone" in update_fields:
+        update_fields["spouse_phone"] = _normalize_phone(update_fields["spouse_phone"])
+    if "heir_phone" in update_fields:
+        update_fields["heir_phone"] = _normalize_phone(update_fields["heir_phone"])
+    if "email" in update_fields:
+        update_fields["email"] = (update_fields["email"] or "").lower() or None
+    update_fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+    update_fields["updated_by"] = user.get("email")
+    await db.customers.update_one({"id": customer_id}, {"$set": update_fields})
+    return {"data": await db.customers.find_one({"id": customer_id}, {"_id": 0})}
+
+
+@api_router.post("/customers/backfill")
+async def backfill_customers(request: Request):
+    """Phase E: scan existing deals, group by phone, create customer doc & link customer_id."""
+    user = await get_current_user(request, db)
+    if user.get("role") not in ["super_admin", "marketing_admin", "management"]:
+        raise HTTPException(status_code=403, detail="Only admins can backfill customers")
+    deals = await db.deals.find({"customer_id": {"$in": [None, ""]}}, {"_id": 0}).to_list(2000)
+    # Also include deals without the field at all
+    deals_no_field = await db.deals.find({"customer_id": {"$exists": False}}, {"_id": 0}).to_list(2000)
+    seen = {d["id"] for d in deals}
+    for d in deals_no_field:
+        if d["id"] not in seen:
+            deals.append(d)
+    created = 0
+    linked = 0
+    for d in deals:
+        cust_id = await _find_or_create_customer_from_deal(d, user.get("email"))
+        if cust_id:
+            await db.deals.update_one({"id": d["id"]}, {"$set": {"customer_id": cust_id}})
+            linked += 1
+            # check if just created
+            c = await db.customers.find_one({"id": cust_id}, {"_id": 0, "created_from": 1})
+            if c and c.get("created_from") == "deal_auto":
+                created += 1  # may double-count if multi deals share same customer; that's OK indicative
+    return {"data": {"deals_processed": len(deals), "linked": linked, "customers_created_or_linked": created}}
+
+
+# ---- Commission Rules ----
+@api_router.get("/commissions/rules")
+async def list_commission_rules(request: Request):
+    await get_current_user(request, db)
+    rules = await db.commission_rules.find({}, {"_id": 0}).sort("priority", -1).to_list(200)
+    return {"data": rules}
+
+
+@api_router.post("/commissions/rules")
+async def create_commission_rule(req: CommissionRuleCreate, request: Request):
+    user = await get_current_user(request, db)
+    if user.get("role") not in ["super_admin", "marketing_admin", "management"]:
+        raise HTTPException(status_code=403, detail="Only admins can create commission rules")
+    now = datetime.now(timezone.utc).isoformat()
+    doc = req.dict()
+    doc["id"] = str(uuid.uuid4())
+    doc["created_by"] = user.get("email")
+    doc["created_at"] = now
+    doc["updated_at"] = now
+    await db.commission_rules.insert_one(doc)
+    doc.pop("_id", None)
+    return {"data": doc}
+
+
+@api_router.put("/commissions/rules/{rule_id}")
+async def update_commission_rule(rule_id: str, req: CommissionRuleUpdate, request: Request):
+    user = await get_current_user(request, db)
+    if user.get("role") not in ["super_admin", "marketing_admin", "management"]:
+        raise HTTPException(status_code=403, detail="Only admins can edit commission rules")
+    update_fields = {k: v for k, v in req.dict().items() if v is not None}
+    update_fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+    await db.commission_rules.update_one({"id": rule_id}, {"$set": update_fields})
+    return {"data": await db.commission_rules.find_one({"id": rule_id}, {"_id": 0})}
+
+
+@api_router.delete("/commissions/rules/{rule_id}")
+async def delete_commission_rule(rule_id: str, request: Request):
+    user = await get_current_user(request, db)
+    if user.get("role") not in ["super_admin", "marketing_admin", "management"]:
+        raise HTTPException(status_code=403, detail="Only admins can delete commission rules")
+    await db.commission_rules.delete_one({"id": rule_id})
+    return {"message": "deleted"}
+
+
+def _calc_commission(rule: dict, deal_price: float) -> float:
+    """Calculate commission amount given a rule and deal price."""
+    rt = rule.get("rate_type", "percent")
+    if rt == "flat":
+        return float(rule.get("rate_value") or 0)
+    if rt == "tier":
+        tiers = rule.get("tiers") or []
+        for t in tiers:
+            mn = t.get("min_amount", 0) or 0
+            mx = t.get("max_amount") or float("inf")
+            if mn <= deal_price < mx:
+                return deal_price * (t.get("rate", 0) / 100.0)
+        return 0.0
+    # percent default
+    return deal_price * (float(rule.get("rate_value") or 0) / 100.0)
+
+
+async def _resolve_commission_rule(deal: dict, assignee_role: str) -> Optional[dict]:
+    """Pick the best matching active rule for a deal. Priority: matching project & role > project only > role only > generic. Within matches, highest `priority` wins."""
+    rules = await db.commission_rules.find({"is_active": True}, {"_id": 0}).to_list(200)
+    candidates = []
+    for r in rules:
+        ok_project = (r.get("project_id") is None) or (r.get("project_id") == deal.get("project_id"))
+        ok_role = (r.get("role") is None) or (r.get("role") == assignee_role)
+        if ok_project and ok_role:
+            specificity = (1 if r.get("project_id") else 0) + (1 if r.get("role") else 0)
+            candidates.append((specificity, r.get("priority", 0), r))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return candidates[0][2]
+
+
+async def _auto_create_commission(deal: dict, by: str):
+    """Phase E: idempotent commission creation when deal becomes 'booked'."""
+    existing = await db.commissions.find_one({"deal_id": deal["id"]}, {"_id": 0, "id": 1})
+    if existing:
+        return None
+    # determine assignee
+    assignee = None
+    assignee_role = None
+    if deal.get("lead_id"):
+        lead = await db.leads.find_one({"id": deal["lead_id"]}, {"_id": 0, "assigned_to": 1})
+        if lead and lead.get("assigned_to"):
+            assignee = lead["assigned_to"]
+    if not assignee:
+        assignee = deal.get("created_by")
+    if assignee:
+        u = await db.users.find_one({"email": assignee}, {"_id": 0, "role": 1})
+        assignee_role = (u or {}).get("role")
+    rule = await _resolve_commission_rule(deal, assignee_role)
+    if not rule:
+        return None
+    amount = _calc_commission(rule, float(deal.get("price") or 0))
+    if amount <= 0:
+        return None
+    now = datetime.now(timezone.utc).isoformat()
+    comm = {
+        "id": str(uuid.uuid4()),
+        "deal_id": deal["id"],
+        "unit_id": deal.get("unit_id"),
+        "project_id": deal.get("project_id"),
+        "customer_name": deal.get("customer_name"),
+        "assignee_email": assignee,
+        "assignee_role": assignee_role,
+        "rule_id": rule["id"],
+        "rule_name": rule.get("name"),
+        "rate_type": rule.get("rate_type"),
+        "rate_value": rule.get("rate_value"),
+        "deal_price": float(deal.get("price") or 0),
+        "amount": amount,
+        "status": "pending",  # pending → approved → paid
+        "payout_date": None,
+        "reference": None,
+        "notes": None,
+        "created_by": by,
+        "created_at": now,
+        "updated_at": now,
+    }
+    await db.commissions.insert_one(comm)
+    comm.pop("_id", None)
+    await db.events.insert_one({
+        "id": str(uuid.uuid4()),
+        "type": "commission.created",
+        "entity_type": "commission",
+        "entity_id": comm["id"],
+        "data": {"deal_id": deal["id"], "amount": amount, "assignee": assignee},
+        "created_at": now,
+    })
+    return comm
+
+
+@api_router.get("/commissions")
+async def list_commissions(
+    request: Request,
+    assignee_email: Optional[str] = None,
+    status: Optional[str] = None,
+    deal_id: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 100,
+):
+    user = await get_current_user(request, db)
+    query: dict = {}
+    if assignee_email:
+        query["assignee_email"] = assignee_email
+    if status:
+        query["status"] = status
+    if deal_id:
+        query["deal_id"] = deal_id
+    # Scoped: sales sees only own
+    if user.get("role") in SCOPED_ROLES:
+        query["assignee_email"] = user.get("email")
+    total = await db.commissions.count_documents(query)
+    items = await db.commissions.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+    return {"data": items, "total": total}
+
+
+@api_router.get("/commissions/stats")
+async def commissions_stats(request: Request, assignee_email: Optional[str] = None):
+    user = await get_current_user(request, db)
+    base = {}
+    if user.get("role") in SCOPED_ROLES:
+        base["assignee_email"] = user.get("email")
+    elif assignee_email:
+        base["assignee_email"] = assignee_email
+    async def _sum(q):
+        agg = await db.commissions.aggregate([{"$match": q}, {"$group": {"_id": None, "t": {"$sum": "$amount"}, "c": {"$sum": 1}}}]).to_list(1)
+        return (agg[0] if agg else {"t": 0, "c": 0})
+    pending = await _sum({**base, "status": "pending"})
+    approved = await _sum({**base, "status": "approved"})
+    paid = await _sum({**base, "status": "paid"})
+    return {"data": {
+        "pending": {"amount": pending["t"], "count": pending["c"]},
+        "approved": {"amount": approved["t"], "count": approved["c"]},
+        "paid": {"amount": paid["t"], "count": paid["c"]},
+    }}
+
+
+@api_router.post("/commissions/{commission_id}/approve")
+async def approve_commission(commission_id: str, request: Request):
+    user = await get_current_user(request, db)
+    if user.get("role") not in ["super_admin", "marketing_admin", "management", "finance"]:
+        raise HTTPException(status_code=403, detail="Only admins/finance can approve commission")
+    now = datetime.now(timezone.utc).isoformat()
+    await db.commissions.update_one({"id": commission_id}, {"$set": {"status": "approved", "approved_at": now, "approved_by": user.get("email"), "updated_at": now}})
+    return {"data": await db.commissions.find_one({"id": commission_id}, {"_id": 0})}
+
+
+@api_router.post("/commissions/{commission_id}/pay")
+async def pay_commission(commission_id: str, req: CommissionPayout, request: Request):
+    user = await get_current_user(request, db)
+    if user.get("role") not in ["super_admin", "finance", "management"]:
+        raise HTTPException(status_code=403, detail="Only finance/admin can mark commission paid")
+    now = datetime.now(timezone.utc).isoformat()
+    await db.commissions.update_one({"id": commission_id}, {"$set": {
+        "status": "paid", "payout_date": req.payout_date, "reference": req.reference, "notes": req.notes,
+        "paid_at": now, "paid_by": user.get("email"), "updated_at": now,
+    }})
+    return {"data": await db.commissions.find_one({"id": commission_id}, {"_id": 0})}
+
+
 # ==================== DASHBOARD ROUTES ====================
 
 @api_router.get("/dashboard")
@@ -2658,6 +3099,24 @@ async def seed_admin():
                 "created_at": datetime.now(timezone.utc).isoformat()
             })
             logger.info(f"Seeded user: {su['email']} ({su['role']})")
+
+    # Phase E: seed default commission rule if collection empty
+    if await db.commission_rules.count_documents({}) == 0:
+        await db.commission_rules.insert_one({
+            "id": str(uuid.uuid4()),
+            "name": "Default Sales Commission 2.5%",
+            "project_id": None,
+            "role": "sales",
+            "rate_type": "percent",
+            "rate_value": 2.5,
+            "tiers": None,
+            "is_active": True,
+            "priority": 0,
+            "created_by": "system",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        })
+        logger.info("Seeded default commission rule (2.5% for sales)")
 
 async def seed_sample_data():
     """Seed sample data for demo purposes"""
@@ -3085,6 +3544,17 @@ async def create_indexes():
     await db.tasks.create_index("related_entity_id")
     await db.tasks.create_index("source_event")
     await db.tasks.create_index([("created_at", -1)])
+    # Phase E: customer & commission indexes
+    await db.customers.create_index("phone")
+    await db.customers.create_index("nik")
+    await db.customers.create_index("email")
+    await db.customers.create_index([("created_at", -1)])
+    await db.commission_rules.create_index([("priority", -1)])
+    await db.commission_rules.create_index("project_id")
+    await db.commissions.create_index("assignee_email")
+    await db.commissions.create_index("deal_id", unique=True)
+    await db.commissions.create_index("status")
+    await db.commissions.create_index([("created_at", -1)])
     logger.info("Indexes ensured")
 
 async def migrate_lead_stages():

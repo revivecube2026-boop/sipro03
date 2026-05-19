@@ -6,7 +6,8 @@ import {
   LayoutDashboard, Building2, Grid3X3, Map, Users, Handshake,
   MessageCircle, FileText, LogOut, ChevronLeft, ChevronRight,
   Import, Globe, DollarSign, HardHat, Bell, Calendar,
-  Target, Phone, UserCheck, RefreshCw, Megaphone, CheckSquare
+  Target, Phone, UserCheck, RefreshCw, Megaphone, CheckSquare,
+  IdCard, Coins
 } from 'lucide-react';
 
 export default function Sidebar() {
@@ -35,9 +36,11 @@ export default function Sidebar() {
 
     { divider: true, label: 'Sales' },
     { path: '/lead-import', icon: Import, label: t('lead_import') },
+    { path: '/customers', icon: IdCard, label: 'Customers' },
     { path: '/deals', icon: Handshake, label: t('deals') },
     { path: '/appointments', icon: Calendar, label: t('appointments') },
     { path: '/tasks', icon: CheckSquare, label: t('tasks') },
+    { path: '/commissions', icon: Coins, label: 'Komisi' },
 
     { divider: true, label: 'Operations' },
     { path: '/finance', icon: DollarSign, label: 'Finance' },

@@ -18,6 +18,8 @@ import ConstructionPage from './components/construction/ConstructionPage';
 import NotificationsPage from './components/notifications/NotificationsPage';
 import AppointmentsPage from './components/appointments/AppointmentsPage';
 import TasksPage from './components/tasks/TasksPage';
+import CustomersPage from './components/customers/CustomersPage';
+import CommissionsPage from './components/commissions/CommissionsPage';
 import './App.css';
 
 function ProtectedRoute({ children }) {
@@ -64,6 +66,8 @@ function AppLayout() {
           <Route path="/notifications" element={<NotificationsPage />} />
           <Route path="/appointments" element={<AppointmentsPage />} />
           <Route path="/tasks" element={<TasksPage />} />
+          <Route path="/customers" element={<CustomersPage />} />
+          <Route path="/commissions" element={<CommissionsPage />} />
         </Routes>
       </div>
     </div>

@@ -1,0 +1,43 @@
+{
+  "summary": "Phase E (Customer Entity + Commission Engine) fully tested. Backend: 29/29 pytest cases pass (customer CRUD with KYC fields incl. NIK digits-only + phone E.164 normalization, duplicate phone/NIK 400, search filter + deal_count enrichment, customer detail with deals[] array, auto-link on POST /api/deals via phone match, reuse-same-customer-on-second-deal-with-same-phone, sales=403 on backfill, admin backfill idempotent on second run (deals_processed=0), commission rules list includes default seed Default Sales Commission 2.5%, sales=403 on create/update/delete rule, admin can create percent+flat rules, auto-commission on POST /api/deals/{id}/booking via lead.assigned_to → assignee_email=sales1 + assignee_role=sales, idempotency verified by re-issuing PUT status=booked → still 1 commission (unique index on deal_id), amount matches deal_price*rate/100, sales scope on GET /api/commissions returns only own rows, stats shape {pending,approved,paid}.{amount,count}, sales=403 on approve, marketing_admin can approve pending→approved, sales=403 on pay, finance can pay approved→paid with payout_date/reference/notes, rule resolution priority: project+role (specificity=2) wins over role-only (priority=100) (specificity beats priority)). Phase D regression: 19/19. Phase C task regression: 19/19. Frontend: admin can render /customers with all KYC fields in create modal (name,nik,npwp,phone,email,address,occupation,monthly_income,spouse_*,heir_*), Backfill+Add buttons present, search/table render. /commissions stats cards render Rp 112.5jt pending/Rp 15jt paid/Rp 0 approved with item counts after data load, filter dropdown + table + Approve/Pay actions present, Commission Rules modal (admin) opens with form (name,type,value,role,add-rule) and lists all 4 rules incl 'Default Sales Commission 2.5%'. Sidebar SALES section shows 'Customers' + 'Komisi' nav entries. Sales-role gating in UI: backfill hidden for sales1, rules-btn hidden for sales1.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "/commissions", "issues": ["Stats cards have an initial render gap of ~1-2s while GET /api/commissions/stats resolves (initial state stats={}). Consider showing skeleton/loader to prevent layout jump."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_phase_e.py",
+    "/app/test_reports/pytest/phase_e_results.xml"
+  ],
+  "action_items": [
+    "[Observation, not a blocker] _auto_create_commission silently returns None when no rule matches the assignee_role (e.g., deal created by super_admin with no lead_id has assignee_role=super_admin; default seed rule has role=sales → no commission). If the product wants admin-created deals to still trigger commissions, seed a generic role=None fallback rule or fall back to seeded rule when no match.",
+    "[Minor UX] Add a tiny loading state for /commissions stats cards so they don't pop in after fetch."
+  ],
+  "critical_code_review_comments": [
+    "server.py is now ~3690 lines — strongly recommend splitting into routers (deals_router.py, leads_router.py, tasks_router.py, customers_router.py, commissions_router.py) before Phase F. Maintenance and merge-conflict risk grows quadratically past ~3000 LOC.",
+    "_find_or_create_customer_from_deal looks up by phone OR name (when no phone). Name-based lookup is fragile (different casing/spaces). Consider phone-only as match key and reject name-only matches at write time, or normalize name (lower-strip).",
+    "_resolve_commission_rule does no priority tiebreaker beyond raw `priority` integer — if two specificity-2 rules both match, ordering depends on Mongo insertion order. Add deterministic secondary sort by created_at ASC.",
+    "_calc_commission for rate_type='tier' uses `for t in tiers; if mn <= price < mx` — this fails to match the very top tier if price == max_amount. Use `<=` on the upper bound for the last tier or document the exclusive-upper convention.",
+    "Backfill loops linearly over all deals and does a per-deal DB find + insert + update — O(N) round-trips. For tenants with thousands of deals this will be slow. Consider bulk_write or building the unique-phone set in memory first.",
+    "create_customer trusts client phone/nik formats then normalizes; consider returning the normalized values in validation errors so the UI shows what was stored (e.g., 'phone normalized to +62...' on dup error)."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_phase_e.py (new — 29 Phase E test cases)"
+  ],
+  "success_rate": {
+    "backend": "100% (29/29 Phase E + 19/19 Phase D + 19/19 Phase C regression)",
+    "frontend": "100% (admin customers/commissions/rules-modal + sales1 RBAC gating verified)"
+  },
+  "test_credentials": "admin@sipro.com/admin123 (super_admin), sales1@sipro.com/sipro123 (sales — scoped), marketing_admin@sipro.com/sipro123 (can approve), finance@sipro.com/sipro123 (can pay) — all confirmed working",
+  "seed_data_creation": "Created TEST_PhaseE_* customers (with unique random phones/NIKs), TEST_PhaseE_proj_* projects with TEST_U_* units via /api/projects/{id}/generate-units, TEST_PhaseE_DealCust_* leads + deals (lead-driven so assignee_role=sales), TEST_PhaseE_rr_* lead+project+units for rule-resolution test, and TEST_E_percent_* / TEST_E_flat_* / TEST_role_only_* / TEST_proj_role_* commission rules (rules cleaned up at test end via DELETE). Resulting DB state: 1 paid commission Rp15M (TEST_PhaseE_DealCust), 3 pending commissions (Rp50M each from TEST_rr and the rule-resolution flows + Rp12.5M legacy 'Commission Test').",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Phase E backend test suite is at /app/backend/tests/test_phase_e.py (29 tests, all PASS). Important: auto-commission only fires when the resolved assignee_role matches an active rule. The default seed rule is role=sales, so deals MUST be created with lead_id pointing to a lead.assigned_to=<sales user> for commissions to auto-create — admin-created deals with no lead get NO commission (current behavior, see action_items). For idempotency: deal_id has a unique index in commissions collection — duplicate booking is a safe no-op (existing row is detected before insert). Rule resolution priority: specificity (project+role > project|role > none) > priority field > insertion order. Frontend hot-reloads; data-testid coverage is complete per the prescribed pattern. If you need to wipe Phase E test data: db.commissions/db.customers/db.commission_rules — match by name regex /^TEST_/ or created_by=admin@sipro.com + created_from='manual'.",
+  "rca of the issue": "No new bugs found. One observation that may or may not be a bug depending on product intent: _auto_create_commission silently no-ops if no rule matches the assignee_role. This means deals created directly by admin (no lead_id, so assignee falls back to deal.created_by=admin → role=super_admin) never produce commission rows because the only seeded rule restricts role=sales. To reproduce: log in as admin, create a unit, POST /api/deals without lead_id, POST /api/deals/{id}/booking, then GET /api/commissions?deal_id=... → empty array. Mitigation options: (a) add a role=None fallback rule, (b) fall back to seeded rule when no match, or (c) document that admin-bypass deals are intentional and require a lead_id."
+}

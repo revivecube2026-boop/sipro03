@@ -98,9 +98,37 @@ Continue development on SIPRO. System is a unit-centric operational system for p
 6. **Dashboard**: `my_tasks: { open, overdue, completed }` exposed per user
 7. **Tested**: 19/19 backend pytest cases pass; full frontend Playwright verification — no bugs.
 
+### Phase D - Production Hardening (2026-05-19)
+1. **Cookie security**: `COOKIE_SECURE` env-driven flag — production sets SameSite=None + Secure=True; dev keeps Lax+False. Centralized via `_set_auth_cookies()`.
+2. **Strict RBAC enforcement**: sales/marketing_inhouse roles only see resources where they are `assigned_to`. Endpoints scoped: `/api/leads` (list+get), `/api/tasks` list, `/api/appointments` list, `/api/deals` list. Single-lead GET returns 403 'Lead bukan milik Anda' if not owner.
+3. **Booking expiry**: deal `reserved_until = now + BOOKING_HOLD_DAYS` (default 7). New endpoint `POST /api/deals/expire-reservations` (admin-only). Background sweeper `_reservation_sweeper()` runs every 15 min, releases expired deals → unit back to `available` + emits `deal.expired` event.
+4. **Atomic unit booking**: `POST /api/deals` uses `find_one_and_update` to atomically transition unit `available→holding`. Eliminates double-booking race condition.
+5. **Load-balanced auto-assign**: `POST /api/leads/auto-assign` picks lowest-load eligible user each iteration (replaces naive round-robin). Returns `loads` dict per user.
+6. **Phone normalization E.164**: `_normalize_phone()` helper. Applied to lead create/import + deal customer_phone. `0812…`, `812…`, `62812…`, `+62812…` all normalize to `+62812…`. Cross-format dedup works.
+7. **Idempotent response time**: new `first_contacted_at` field. `response_time_minutes` computed only ONCE on first acquisition→nurturing transition. Bouncing back and re-contacting does not reset metric.
+8. **MongoDB indexes**: added `tasks.{status,assigned_to,type,due_date,related_entity_id,source_event}`, `deals.reserved_until`, `events.entity_id`, `appointments.{lead_id,assigned_to}`.
+9. **Tested**: 19/19 Phase D pytest cases pass + Phase C 19/19 regression pass. Frontend smoke verified sales1 sees only own leads, admin sees all.
+
 ## Prioritized Backlog
 
-### P1 (Phase D - Enhancement)
+### P0 (Phase E - Customer Entity & Commission)
+- [ ] First-class `customers` collection: NIK, NPWP, alamat, pasangan, ahli waris
+- [ ] Backfill customers from existing deals (group by phone) — non-destructive
+- [ ] Deal → customer_id link (kept duplicate fields for backward-compat)
+- [ ] Customers CRUD endpoints + UI
+- [ ] Commission rules (per project / per role / flat % or tier)
+- [ ] Auto-calculate commission on deal status=booked
+- [ ] Commission payout tracking
+
+### P0 (Phase F - Legal Documents & KPR)
+- [ ] Document workflow: SPK, PPJB, AJB, BAST templates (Bahasa Indonesia formal)
+- [ ] Server-side PDF generation
+- [ ] E-sign placeholder (upload + timestamp)
+- [ ] Financing module: bank, plafond, DP, tenor, BI checking, approval status
+- [ ] Deal → financing application link
+- [ ] Auto-generate billing schedule template (DP% + cicilan + serah terima)
+
+### P1 (Phase G - Original Phase D Enhancements)
 - [ ] SLA logic and escalation (Lead Response Time)
 - [ ] WhatsApp incoming message detection
 - [ ] Broadcast system for acquisition stage (limited to acquisition stage only)
@@ -118,9 +146,9 @@ Continue development on SIPRO. System is a unit-centric operational system for p
 - [ ] Recurring task scheduler
 
 ## Next Tasks
-1. Phase D: SLA logic + escalation rules
-2. Phase D: WhatsApp incoming message tracking
-3. Phase D: Broadcast system (Acquisition stage only)
+1. **Phase E**: Customer entity + Commission engine
+2. **Phase F**: Documents (PPJB/AJB) + KPR module
+3. **Phase G**: SLA escalation, WhatsApp incoming, Broadcast, marketing ROI, lead scoring
 
 ## Reports
 - Detailed Development Report: `/app/DEVELOPMENT_REPORT.md`
